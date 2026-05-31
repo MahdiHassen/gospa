@@ -33,8 +33,9 @@ As a team, we propose the following list of weekly milestones that aim to accomp
 To achieve the weekly milestones listed above, we break down the tasks for each team member. Note that at the start of the project, Fred, Mahdi and Sara will be focusing on the SW model while Emon and Adil will get into the HW implementation. Based on the milestones above, we expect to finish the full SW model before July 5, at which the SW team members will turn to facilitate the finalization of RTL implementation and start system integration & testing. The following table summarizes the specific breakdown for each team member, based on the dates where we expect each milestone to be accomplished. 
 
 |   |  Fred | Mahdi  | Sara  | Emon  | Adil  |
+|---|A |  B | C  | D  | E|
 |---|---|---|---|---|---|
-| June 7  |  A |  B | C  | D  | E  |
+| June 7  |  A |  B | Breakdown the implementation into submodules to determine the functional tests   | D  | E  |
 | June 14 |   |   |   |   |   |
 |  June 21 |   |   |   |   |   |
 |  June 28 |   |   |   |   |   |
