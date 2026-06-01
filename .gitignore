@@ -1,0 +1,8 @@
+# Verilator build output
+obj_dir/
+
+# Simulation outputs
+*.vcd
+*.fst
+*.lxt
+*.vvp
