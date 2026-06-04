@@ -190,24 +190,30 @@ def broadcast_to_fifo_b(fifo_a, wsps):
 # PE
 # ---------------------------------------------------------------------------
 
-def pe_process(fifo_b, sparse_weights, pe_id=0):
+def pe_process(fifo_b, sparse_weights, pe_id=0, num_mults=4):
     """
-    Cycle-accurate PE processing per Fig. 13.
+    Cycle-accurate PE with `num_mults` multiplier lanes.
+
+    Dispatch rule per cycle: peek FIFO-B head, take up to `num_mults` entries
+    from the head that ALL share the head's PID. As soon as a differing PID
+    is encountered, the batch is cut short for this cycle (the differing
+    entry waits for the next cycle, even if a multiplier slot is free).
 
     State: Curr_Wgt (+Curr_Wgt_PID), Next_Wgt (+Next_Wgt_PID).
-        KEEP   : incoming PID == Curr_Wgt_PID. Reuse Curr_Wgt.
-        UPDATE : incoming PID changed. Promote Next -> Curr, pull a fresh
-                 Next from sparse weight storage.
+        KEEP   : batch PID == Curr_Wgt_PID. Reuse Curr_Wgt.
+        UPDATE : batch PID changed. Promote Next -> Curr, pull a fresh Next
+                 from sparse weight storage.
 
-    Each cycle: ACCUM[CID] += ACT * Curr_Wgt.
+    Each lane k owns its own CID-indexed accumulator ACCUM_k. This avoids
+    write-port contention on the accum file (the lanes can target different
+    CIDs in parallel). At readout we sum across lanes for the final result.
 
-        fifo_b         : ordered (Axy, CID, PID) stream from Stage 2. PIDs are
-                         monotonically non-decreasing because Stage 2 drains
-                         FIFO-A[0..F^2-1] in order.
-        sparse_weights : [(PID, weight), ...] in PID order -- the PE's kernel
-                         after WSP-based sparsification.
+        fifo_b         : ordered (Axy, CID, PID) stream from Stage 2.
+        sparse_weights : [(PID, weight), ...] in PID order.
+        num_mults      : multiplier lanes per PE (default 4).
     """
-    print(f"[PE#{pe_id}] sparse_weights={sparse_weights}, stream_len={len(fifo_b)}")
+    print(f"[PE#{pe_id}] sparse_weights={sparse_weights}, "
+          f"stream_len={len(fifo_b)}, mults={num_mults}")
     if not sparse_weights or not fifo_b:
         print(f"[PE#{pe_id}] nothing to compute")
         return {}
@@ -219,9 +225,21 @@ def pe_process(fifo_b, sparse_weights, pe_id=0):
     print(f"[PE#{pe_id}] init Curr=(PID={curr_pid}, w={curr_wgt}) "
           f"Next=(PID={next_pid}, w={next_wgt})")
 
-    accum = {}
-    for cycle, (axy, cid, pid) in enumerate(fifo_b, start=1):
-        if pid == curr_pid:
+    accums = [{} for _ in range(num_mults)]
+    i = 0
+    cycle = 0
+    while i < len(fifo_b):
+        cycle += 1
+        head_pid = fifo_b[i][2]
+
+        j = i
+        while (j < len(fifo_b)
+               and j - i < num_mults
+               and fifo_b[j][2] == head_pid):
+            j += 1
+        batch = fifo_b[i:j]
+
+        if head_pid == curr_pid:
             action = "KEEP  "
         else:
             action = "UPDATE"
@@ -232,14 +250,26 @@ def pe_process(fifo_b, sparse_weights, pe_id=0):
             else:
                 next_pid, next_wgt = None, None
 
-        prod = axy * curr_wgt
-        accum[cid] = accum.get(cid, 0) + prod
-        print(f"  cyc#{cycle} {action} | ACT={axy} CID={cid} PID={pid} "
-              f"| Curr=(PID={curr_pid}, w={curr_wgt}) Next=(PID={next_pid}, w={next_wgt}) "
-              f"| {axy}*{curr_wgt}={prod} -> ACCUM[{cid}]={accum[cid]}")
+        print(f"  cyc#{cycle} {action} | batch={len(batch)} PID={head_pid} "
+              f"| Curr=(PID={curr_pid}, w={curr_wgt}) Next=(PID={next_pid}, w={next_wgt})")
+        for lane, entry in enumerate(batch):
+            axy, cid = entry[0], entry[1]
+            prod = axy * curr_wgt
+            accums[lane][cid] = accums[lane].get(cid, 0) + prod
+            print(f"    lane#{lane}: ACT={axy} CID={cid} | {axy}*{curr_wgt}={prod} "
+                  f"-> ACCUM_{lane}[{cid}]={accums[lane][cid]}")
 
-    print(f"[PE#{pe_id}] ACCUM = {dict(sorted(accum.items()))}")
-    return accum
+        i = j
+
+    combined = {}
+    for a in accums:
+        for cid, val in a.items():
+            combined[cid] = combined.get(cid, 0) + val
+    print(f"[PE#{pe_id}] per-lane ACCUMs:")
+    for lane, a in enumerate(accums):
+        print(f"  lane#{lane} = {dict(sorted(a.items()))}")
+    print(f"[PE#{pe_id}] combined ACCUM = {dict(sorted(combined.items()))}")
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -382,8 +412,6 @@ if __name__ == "__main__":
     #   kernel [[0,1],[0,2]]  -> WSP=0101, sparse weights [(1,1),(3,2)]
     #   FIFO-B stream (cycle 1..5): see ACT/CID/PID rows in Fig. 13.
     # Expected output (CID-wise accumulation): {0:-4, 1:2, 2:4, 3:-6}
-
-    #TODO: Fix me!
     print("\n=== PE: Fig. 13 replay ===")
     fig13_weights = [(1, 1), (3, 2)]
     fig13_stream = [
