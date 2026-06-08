@@ -106,7 +106,11 @@ def pcid_to_cid_pid(axy, px, py, cx, cy, F, H, S):
     One a_xy can match multiple weights, so multiple (CID, PID) pairs may
     come out. Axy is carried through with each pair.
     """
-    G = F // S
+    # Paper writes G = floor(F/S), but that under-counts when F % S != 0
+    # (e.g. F=3, S=2 -> floor=1 but we need m=1 to reach kernel row 2).
+    # The in_f gate below still filters invalid (m, n), so widening to
+    # ceil(F/S) is safe.
+    G = (F + S - 1) // S
     E = (H - F) // S + 1
     print(f"[pcid_to_cid_pid] Axy={axy} Px={px} Py={py} Cx={cx} Cy={cy} "
           f"(F={F}, H={H}, S={S} -> G={G}, E={E})")
@@ -273,6 +277,76 @@ def pe_process(fifo_b, sparse_weights, pe_id=0, num_mults=4):
 
 
 # ---------------------------------------------------------------------------
+# PE v2 -- multi-WSP interpretation
+# ---------------------------------------------------------------------------
+
+def wsp_union(wsps):
+    """OR all WSPs together (used to gate Stage 2 broadcast for the v2 PE)."""
+    if not wsps:
+        return []
+    F2 = len(wsps[0])
+    return [1 if any(w[p] for w in wsps) else 0 for p in range(F2)]
+
+
+def pe_process_v2(fifo_b, wsps, sparse_weights_list, pe_id=0):
+    """
+    Multi-WSP PE. The PE holds K kernels (one per multiplier lane); FIFO-B
+    is gated upstream by the UNION of all `wsps`. Per cycle:
+        - pop one activation (ACT, CID, PID) from FIFO-B
+        - for each lane k, if wsps[k][PID] == 1:
+              maybe UPDATE lane k's Curr/Next from its private weight stream
+              ACCUM_k[CID] += ACT * curr_wgt_k
+          else:
+              lane idles this cycle.
+
+    Each lane represents a distinct output channel held in this PE, so we
+    return a list of K ACCUM dicts (NOT summed).
+    """
+    K = len(wsps)
+    print(f"[PE-v2#{pe_id}] lanes={K}, stream_len={len(fifo_b)}")
+
+    curr = [(sw[0] if sw else (None, None)) for sw in sparse_weights_list]
+    nxt  = [(sw[1] if len(sw) >= 2 else (None, None)) for sw in sparse_weights_list]
+    cursors = [2] * K
+    accums = [{} for _ in range(K)]
+
+    for lane in range(K):
+        print(f"  lane#{lane} init Curr=(PID={curr[lane][0]}, w={curr[lane][1]}) "
+              f"Next=(PID={nxt[lane][0]}, w={nxt[lane][1]}) wsp={wsps[lane]}")
+
+    for cycle, (axy, cid, pid) in enumerate(fifo_b, start=1):
+        print(f"  cyc#{cycle} ACT={axy} CID={cid} PID={pid}")
+        for lane in range(K):
+            if wsps[lane][pid] != 1:
+                print(f"    lane#{lane} IDLE  (WSP_{lane}[{pid}]=0)")
+                continue
+
+            if curr[lane][0] != pid:
+                action = "UPDATE"
+                curr[lane] = nxt[lane]
+                sw = sparse_weights_list[lane]
+                if cursors[lane] < len(sw):
+                    nxt[lane] = sw[cursors[lane]]
+                    cursors[lane] += 1
+                else:
+                    nxt[lane] = (None, None)
+            else:
+                action = "KEEP  "
+
+            wgt = curr[lane][1]
+            prod = axy * wgt
+            accums[lane][cid] = accums[lane].get(cid, 0) + prod
+            print(f"    lane#{lane} {action} | Curr=(PID={curr[lane][0]}, w={wgt}) "
+                  f"Next=(PID={nxt[lane][0]}, w={nxt[lane][1]}) "
+                  f"| {axy}*{wgt}={prod} -> ACCUM_{lane}[{cid}]={accums[lane][cid]}")
+
+    print(f"[PE-v2#{pe_id}] per-lane ACCUMs:")
+    for lane, a in enumerate(accums):
+        print(f"  lane#{lane} = {dict(sorted(a.items()))}")
+    return accums
+
+
+# ---------------------------------------------------------------------------
 # Full pipeline & reference
 # ---------------------------------------------------------------------------
 
@@ -331,6 +405,36 @@ def conv2d_reference(activation, kernel, stride):
     return out
 
 
+def gospa_conv2d_v2(activation, kernels, stride):
+    """
+    Drive the multi-WSP PE (v2). All `kernels` are packed into one PE, one
+    per multiplier lane. Returns a list of ExE output matrices, one per kernel.
+    """
+    H = len(activation)
+    F = len(kernels[0])
+    E = (H - F) // stride + 1
+
+    values, col_idx, row_ptr = dense_to_csr(activation)
+    wsps, sparse_weights_list = [], []
+    for k in kernels:
+        wsp, sw = kernel_to_sparse(k)
+        wsps.append(wsp)
+        sparse_weights_list.append(sw)
+    union = wsp_union(wsps)
+
+    positional = csr_to_positional(values, col_idx, row_ptr)
+    decoded = [axy_to_pcid(axy, x, y, stride) for (axy, x, y) in positional]
+    pairs = []
+    for (axy, px, py, cx, cy) in decoded:
+        pairs.extend(pcid_to_cid_pid(axy, px, py, cx, cy, F=F, H=H, S=stride))
+    filtered = zero_act_filter(pairs)
+    fifo_a = route_to_fifo_a(filtered, F=F)
+    fifo_b_list = broadcast_to_fifo_b(fifo_a, [union])
+
+    accums = pe_process_v2(fifo_b_list[0], wsps, sparse_weights_list, pe_id=0)
+    return [accum_to_matrix(a, E) for a in accums]
+
+
 def gospa_conv2d(activation, kernel, stride):
     """
     Drive a dense (activation, kernel, stride) through the full goSPA pipeline
@@ -354,6 +458,91 @@ def gospa_conv2d(activation, kernel, stride):
     accum = pe_process(fifo_b_list[0], sparse_weights, pe_id=0)
 
     return accum_to_matrix(accum, E)
+
+
+# ---------------------------------------------------------------------------
+# goSPA accelerator (multi-PE)
+# ---------------------------------------------------------------------------
+
+def goSPA_run(activation, kernels, stride,
+              num_pes=8, num_mults=4, interpretation="v1"):
+    """
+    Run a full conv layer on a goSPA accelerator with `num_pes` PEs of
+    `num_mults` multipliers each.
+
+    Mapping policies:
+      "v1": one kernel per PE; needs len(kernels) <= num_pes.
+            Each PE uses pe_process (same-PID batching across `num_mults`).
+      "v2": up to `num_mults` kernels per PE (one per lane); needs
+            len(kernels) <= num_pes * num_mults.
+            Each PE uses pe_process_v2 (one activation/cycle, lanes idle when
+            their WSP[PID]=0).
+
+    Returns one ExE output map per kernel, in the same order as `kernels`.
+    """
+    import contextlib, io
+
+    H = len(activation)
+    F = len(kernels[0])
+    E = (H - F) // stride + 1
+    K = len(kernels)
+
+    cap = num_pes if interpretation == "v1" else num_pes * num_mults
+    if K > cap:
+        raise ValueError(f"{interpretation}: capacity is {cap} kernels, got {K}")
+
+    print(f"[goSPA] {num_pes} PEs x {num_mults} mults | mode={interpretation} "
+          f"| H={H}, F={F}, S={stride} -> E={E} | {K} output channels")
+
+    values, col_idx, row_ptr = dense_to_csr(activation)
+    wsps, sw_lists = [], []
+    for k in kernels:
+        w, sw = kernel_to_sparse(k)
+        wsps.append(w)
+        sw_lists.append(sw)
+
+    if interpretation == "v1":
+        pe_chunks = [[i] for i in range(K)]
+        pe_wsps = [wsps[c[0]] for c in pe_chunks]
+    else:
+        pe_chunks = []
+        for pe in range(num_pes):
+            chunk = list(range(pe * num_mults, min((pe + 1) * num_mults, K)))
+            if chunk:
+                pe_chunks.append(chunk)
+        pe_wsps = [wsp_union([wsps[k] for k in c]) for c in pe_chunks]
+
+    sink = io.StringIO()
+    with contextlib.redirect_stdout(sink):
+        positional = csr_to_positional(values, col_idx, row_ptr)
+        decoded = [axy_to_pcid(axy, x, y, stride) for (axy, x, y) in positional]
+        pairs = []
+        for (axy, px, py, cx, cy) in decoded:
+            pairs.extend(pcid_to_cid_pid(axy, px, py, cx, cy, F=F, H=H, S=stride))
+        filtered = zero_act_filter(pairs)
+        fifo_a = route_to_fifo_a(filtered, F=F)
+        fifo_b_list = broadcast_to_fifo_b(fifo_a, pe_wsps)
+
+    outputs = [None] * K
+    print(f"  non-zero activations after Stage 1 filter = {len(filtered)}")
+    for pe, chunk in enumerate(pe_chunks):
+        fb = fifo_b_list[pe]
+        print(f"  PE#{pe}: kernels={chunk}, |FIFO-B|={len(fb)}")
+        with contextlib.redirect_stdout(sink):
+            if interpretation == "v1":
+                k = chunk[0]
+                accum = pe_process(fb, sw_lists[k],
+                                   pe_id=pe, num_mults=num_mults)
+                outputs[k] = accum_to_matrix(accum, E)
+            else:
+                accums = pe_process_v2(fb,
+                                       [wsps[k] for k in chunk],
+                                       [sw_lists[k] for k in chunk],
+                                       pe_id=pe)
+                for lane, k in enumerate(chunk):
+                    outputs[k] = accum_to_matrix(accums[lane], E)
+
+    return outputs
 
 
 # ---------------------------------------------------------------------------
@@ -454,3 +643,103 @@ if __name__ == "__main__":
         print(f"    goSPA     = {gospa}")
         print(f"    MATCH     = {ok}")
     print(f"\noverall: {'PASS' if all_ok else 'FAIL'}")
+
+    # ---- Multi-WSP PE (v2): one PE holds several kernels ----
+    print("\n=== Verification v2: multi-WSP PE vs. per-kernel reference ===")
+    v2_cases = [
+        ("3x3 activation, 2 kernels packed (Fig.13 + Fig.7 PE#1)",
+         [[1, 0, 2], [0, -2, 0], [-1, 3, -3]],
+         [[[0, 1], [0, 2]],
+          [[1, 0], [3, 0]]],
+         1),
+        ("4x4 activation, 3 kernels packed",
+         [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]],
+         [[[1, 0], [0, 1]],
+          [[0, 2], [-1, 0]],
+          [[1, 1], [1, 1]]],
+         1),
+    ]
+
+    all_ok_v2 = True
+    for name, activation, kernels, stride in v2_cases:
+        refs = [conv2d_reference(activation, k, stride) for k in kernels]
+        with contextlib.redirect_stdout(io.StringIO()):
+            gospas = gospa_conv2d_v2(activation, kernels, stride)
+        ok = (refs == gospas)
+        all_ok_v2 = all_ok_v2 and ok
+        print(f"  {name}")
+        for i, (r, g) in enumerate(zip(refs, gospas)):
+            print(f"    kernel#{i} reference = {r}")
+            print(f"    kernel#{i} goSPA-v2  = {g}")
+        print(f"    MATCH = {ok}")
+    print(f"\nv2 overall: {'PASS' if all_ok_v2 else 'FAIL'}")
+
+    # ---- Map MobileNetV2's first conv (red channel) onto goSPA ----
+    # First conv shape: (out=32, in=3, kH=3, kW=3), stride=2.
+    # We treat one input channel (red, in_ch=0) per filter as a 3x3 kernel
+    # and run all 32 filter-red-channels through the accelerator.
+    print("\n=== goSPA: MobileNetV2 first conv (red channel) ===")
+    import os, sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "testing", "ref"))
+    from mobilenet import get_first_conv  # noqa: E402
+
+    _, conv0 = get_first_conv()
+    int_w = conv0.weight().int_repr().numpy()  # (32, 3, 3, 3) int8
+    red_kernels = [[[int(v) for v in row] for row in int_w[f, 0]]
+                   for f in range(int_w.shape[0])]
+    print(f"  loaded {len(red_kernels)} red-channel 3x3 kernels from MobileNetV2 first conv")
+
+    # 9x9 sparse INT8 activation; with F=3, S=2 -> E=4 (4x4 outputs).
+    activation_red = [
+        [10,  0,  0,  0, 20,  0,  0, 30,  0],
+        [ 0, 15,  0, 25,  0,  0,  0,  0, 35],
+        [ 5,  0, 12,  0,  0, 28,  0, 40,  0],
+        [ 0,  0,  0, 18,  0,  0, 22,  0, 50],
+        [ 0,  8,  0,  0, 14,  0,  0,  0,  0],
+        [33,  0,  0, 11,  0, 45,  0,  0,  0],
+        [ 0,  0, 27,  0,  0,  0, 16,  0, 19],
+        [ 7,  0,  0,  0, 60,  0,  0, 24,  0],
+        [ 0, 13,  0, 38,  0,  0, 42,  0,  9],
+    ]
+    NUM_PES, NUM_MULTS, STRIDE = 8, 4, 2
+
+    # Independent ground truth via PyTorch's conv2d (cross-correlation, no flip
+    # -- same convention as our model).
+    import torch
+    import torch.nn.functional as Fnn
+
+    def torch_conv_ref(activation, kernels, stride):
+        act_t = torch.tensor(activation, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        ker_t = torch.tensor(kernels, dtype=torch.float32).unsqueeze(1)
+        out_t = Fnn.conv2d(act_t, ker_t, stride=stride, padding=0).squeeze(0)
+        return [out_t[c].int().tolist() for c in range(out_t.shape[0])]
+
+    print("\n-- v1 mapping: PE#k = filter[k]'s red channel (filters 0..7) --")
+    out_v1 = goSPA_run(activation_red, red_kernels[:NUM_PES], stride=STRIDE,
+                      num_pes=NUM_PES, num_mults=NUM_MULTS, interpretation="v1")
+    refs_v1 = [conv2d_reference(activation_red, k, STRIDE)
+               for k in red_kernels[:NUM_PES]]
+    torch_v1 = torch_conv_ref(activation_red, red_kernels[:NUM_PES], STRIDE)
+    ok_v1_ref = (out_v1 == refs_v1)
+    ok_v1_torch = (out_v1 == torch_v1)
+    ok_ref_torch_v1 = (refs_v1 == torch_v1)
+    print(f"  v1 vs Python ref : {ok_v1_ref}")
+    print(f"  v1 vs PyTorch    : {ok_v1_torch}")
+    print(f"  Python ref vs PyTorch: {ok_ref_torch_v1}")
+
+    print(f"\n-- v2 mapping: 32 filters' red channel across "
+          f"{NUM_PES} PEs x {NUM_MULTS} lanes --")
+    out_v2 = goSPA_run(activation_red, red_kernels, stride=STRIDE,
+                      num_pes=NUM_PES, num_mults=NUM_MULTS, interpretation="v2")
+    refs_v2 = [conv2d_reference(activation_red, k, STRIDE) for k in red_kernels]
+    torch_v2 = torch_conv_ref(activation_red, red_kernels, STRIDE)
+    ok_v2_ref = (out_v2 == refs_v2)
+    ok_v2_torch = (out_v2 == torch_v2)
+    ok_ref_torch_v2 = (refs_v2 == torch_v2)
+    print(f"  v2 vs Python ref : {ok_v2_ref}")
+    print(f"  v2 vs PyTorch    : {ok_v2_torch}")
+    print(f"  Python ref vs PyTorch: {ok_ref_torch_v2}")
+
+    print(f"\nMobileNet goSPA mapping (vs PyTorch): "
+          f"v1={'PASS' if ok_v1_torch else 'FAIL'}, "
+          f"v2={'PASS' if ok_v2_torch else 'FAIL'}")
