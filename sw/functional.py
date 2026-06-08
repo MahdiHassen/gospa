@@ -13,6 +13,25 @@ This file builds the model bottom-up. Each substage is its own function with
 prints so we can checkpoint functional correctness as we go.
 """
 
+import contextlib
+
+
+# Global verbosity flag. Pipeline functions guard their hot-loop prints with
+# `if _VERBOSE:` so large inputs (e.g. 224x224 activations) don't pay the
+# f-string formatting cost. Use `_quiet()` to silence within a block.
+_VERBOSE = True
+
+
+@contextlib.contextmanager
+def _quiet():
+    global _VERBOSE
+    orig = _VERBOSE
+    _VERBOSE = False
+    try:
+        yield
+    finally:
+        _VERBOSE = orig
+
 
 # ---------------------------------------------------------------------------
 # APU Stage 1
@@ -33,10 +52,11 @@ def csr_to_positional(values, col_idx, row_ptr):
             X   = its row    index in the dense matrix
             Y   = its column index in the dense matrix
     """
-    print("[csr_to_positional] decoding CSR -> positional stream")
-    print(f"  values  = {values}")
-    print(f"  col_idx = {col_idx}")
-    print(f"  row_ptr = {row_ptr}")
+    if _VERBOSE:
+        print("[csr_to_positional] decoding CSR -> positional stream")
+        print(f"  values  = {values}")
+        print(f"  col_idx = {col_idx}")
+        print(f"  row_ptr = {row_ptr}")
 
     num_rows = len(row_ptr) - 1
     stream = []
@@ -47,9 +67,9 @@ def csr_to_positional(values, col_idx, row_ptr):
             axy = values[k]
             col = col_idx[k]
             stream.append((axy, row, col))
-            print(f"  emit (Axy={axy}, X={row}, Y={col})")
+            if _VERBOSE: print(f"  emit (Axy={axy}, X={row}, Y={col})")
 
-    print(f"[csr_to_positional] emitted {len(stream)} elements")
+    if _VERBOSE: print(f"[csr_to_positional] emitted {len(stream)} elements")
     return stream
 
 
@@ -62,12 +82,14 @@ def route_to_fifo_a(stream, F):
     """
     num_fifos = F * F
     fifos = [[] for _ in range(num_fifos)]
-    print(f"[route_to_fifo_a] {num_fifos} FIFOs (F={F}), routing {len(stream)} elements")
+    if _VERBOSE:
+        print(f"[route_to_fifo_a] {num_fifos} FIFOs (F={F}), routing {len(stream)} elements")
     for (axy, cid, pid) in stream:
         fifos[pid].append((axy, cid))
-        print(f"  push (Axy={axy}, CID={cid}) -> FIFO-A[{pid}]")
-    for pid, fifo in enumerate(fifos):
-        print(f"  FIFO-A[{pid}] = {fifo}")
+        if _VERBOSE: print(f"  push (Axy={axy}, CID={cid}) -> FIFO-A[{pid}]")
+    if _VERBOSE:
+        for pid, fifo in enumerate(fifos):
+            print(f"  FIFO-A[{pid}] = {fifo}")
     return fifos
 
 
@@ -79,16 +101,16 @@ def zero_act_filter(stream):
     as its own block so the model mirrors the RTL pipeline (zero_act.sv) and
     handles dense feeds or post-decode zeros.
     """
-    print(f"[zero_act_filter] in: {len(stream)} elements")
+    if _VERBOSE: print(f"[zero_act_filter] in: {len(stream)} elements")
     kept = []
     for entry in stream:
         axy = entry[0]
         if axy == 0:
-            print(f"  drop {entry} (Axy==0)")
+            if _VERBOSE: print(f"  drop {entry} (Axy==0)")
         else:
-            print(f"  keep {entry}")
+            if _VERBOSE: print(f"  keep {entry}")
             kept.append(entry)
-    print(f"[zero_act_filter] out: {len(kept)} elements")
+    if _VERBOSE: print(f"[zero_act_filter] out: {len(kept)} elements")
     return kept
 
 
@@ -112,8 +134,9 @@ def pcid_to_cid_pid(axy, px, py, cx, cy, F, H, S):
     # ceil(F/S) is safe.
     G = (F + S - 1) // S
     E = (H - F) // S + 1
-    print(f"[pcid_to_cid_pid] Axy={axy} Px={px} Py={py} Cx={cx} Cy={cy} "
-          f"(F={F}, H={H}, S={S} -> G={G}, E={E})")
+    if _VERBOSE:
+        print(f"[pcid_to_cid_pid] Axy={axy} Px={px} Py={py} Cx={cx} Cy={cy} "
+              f"(F={F}, H={H}, S={S} -> G={G}, E={E})")
 
     pairs = []
     for m in range(G):
@@ -126,9 +149,9 @@ def pcid_to_cid_pid(axy, px, py, cx, cy, F, H, S):
                 cid = cx_off * E + cy_off
                 pid = (px + m * S) * F + (py + n * S)
                 pairs.append((axy, cid, pid))
-                print(f"  match m={m}, n={n} -> CID={cid}, PID={pid}")
+                if _VERBOSE: print(f"  match m={m}, n={n} -> CID={cid}, PID={pid}")
 
-    if not pairs:
+    if _VERBOSE and not pairs:
         print("  (no matches)")
     return pairs
 
@@ -147,8 +170,9 @@ def axy_to_pcid(axy, x, y, stride):
     py = y % stride
     cx = x // stride
     cy = y // stride
-    print(f"[axy_to_pcid] (Axy={axy}, X={x}, Y={y}, S={stride}) -> "
-          f"Px={px}, Py={py}, Cx={cx}, Cy={cy}")
+    if _VERBOSE:
+        print(f"[axy_to_pcid] (Axy={axy}, X={x}, Y={y}, S={stride}) -> "
+              f"Px={px}, Py={py}, Cx={cx}, Cy={cy}")
     return axy, px, py, cx, cy
 
 
@@ -172,21 +196,23 @@ def broadcast_to_fifo_b(fifo_a, wsps):
     """
     num_pes = len(wsps)
     fifo_b = [[] for _ in range(num_pes)]
-    print(f"[broadcast_to_fifo_b] {len(fifo_a)} FIFO-A's -> {num_pes} FIFO-B's")
+    if _VERBOSE:
+        print(f"[broadcast_to_fifo_b] {len(fifo_a)} FIFO-A's -> {num_pes} FIFO-B's")
     for pid, entries in enumerate(fifo_a):
-        print(f"  draining FIFO-A[{pid}] ({len(entries)} entries)")
+        if _VERBOSE: print(f"  draining FIFO-A[{pid}] ({len(entries)} entries)")
         if not entries:
-            print(f"    (empty, nothing to broadcast)")
+            if _VERBOSE: print(f"    (empty, nothing to broadcast)")
             continue
         for k, wsp in enumerate(wsps):
             if wsp[pid] == 1:
                 for (axy, cid) in entries:
                     fifo_b[k].append((axy, cid, pid))
-                    print(f"    broadcast (Axy={axy}, CID={cid}, PID={pid}) -> FIFO-B[{k}]")
+                    if _VERBOSE: print(f"    broadcast (Axy={axy}, CID={cid}, PID={pid}) -> FIFO-B[{k}]")
             else:
-                print(f"    PE#{k} WSP[{pid}]=0, skip")
-    for k, fb in enumerate(fifo_b):
-        print(f"  FIFO-B[{k}] = {fb}")
+                if _VERBOSE: print(f"    PE#{k} WSP[{pid}]=0, skip")
+    if _VERBOSE:
+        for k, fb in enumerate(fifo_b):
+            print(f"  FIFO-B[{k}] = {fb}")
     return fifo_b
 
 
@@ -216,18 +242,20 @@ def pe_process(fifo_b, sparse_weights, pe_id=0, num_mults=4):
         sparse_weights : [(PID, weight), ...] in PID order.
         num_mults      : multiplier lanes per PE (default 4).
     """
-    print(f"[PE#{pe_id}] sparse_weights={sparse_weights}, "
-          f"stream_len={len(fifo_b)}, mults={num_mults}")
+    if _VERBOSE:
+        print(f"[PE#{pe_id}] sparse_weights={sparse_weights}, "
+              f"stream_len={len(fifo_b)}, mults={num_mults}")
     if not sparse_weights or not fifo_b:
-        print(f"[PE#{pe_id}] nothing to compute")
+        if _VERBOSE: print(f"[PE#{pe_id}] nothing to compute")
         return {}
 
     curr_pid, curr_wgt = sparse_weights[0]
     next_pid, next_wgt = (sparse_weights[1] if len(sparse_weights) >= 2
                          else (None, None))
     cursor = 2
-    print(f"[PE#{pe_id}] init Curr=(PID={curr_pid}, w={curr_wgt}) "
-          f"Next=(PID={next_pid}, w={next_wgt})")
+    if _VERBOSE:
+        print(f"[PE#{pe_id}] init Curr=(PID={curr_pid}, w={curr_wgt}) "
+              f"Next=(PID={next_pid}, w={next_wgt})")
 
     accums = [{} for _ in range(num_mults)]
     i = 0
@@ -254,14 +282,16 @@ def pe_process(fifo_b, sparse_weights, pe_id=0, num_mults=4):
             else:
                 next_pid, next_wgt = None, None
 
-        print(f"  cyc#{cycle} {action} | batch={len(batch)} PID={head_pid} "
-              f"| Curr=(PID={curr_pid}, w={curr_wgt}) Next=(PID={next_pid}, w={next_wgt})")
+        if _VERBOSE:
+            print(f"  cyc#{cycle} {action} | batch={len(batch)} PID={head_pid} "
+                  f"| Curr=(PID={curr_pid}, w={curr_wgt}) Next=(PID={next_pid}, w={next_wgt})")
         for lane, entry in enumerate(batch):
             axy, cid = entry[0], entry[1]
             prod = axy * curr_wgt
             accums[lane][cid] = accums[lane].get(cid, 0) + prod
-            print(f"    lane#{lane}: ACT={axy} CID={cid} | {axy}*{curr_wgt}={prod} "
-                  f"-> ACCUM_{lane}[{cid}]={accums[lane][cid]}")
+            if _VERBOSE:
+                print(f"    lane#{lane}: ACT={axy} CID={cid} | {axy}*{curr_wgt}={prod} "
+                      f"-> ACCUM_{lane}[{cid}]={accums[lane][cid]}")
 
         i = j
 
@@ -269,10 +299,11 @@ def pe_process(fifo_b, sparse_weights, pe_id=0, num_mults=4):
     for a in accums:
         for cid, val in a.items():
             combined[cid] = combined.get(cid, 0) + val
-    print(f"[PE#{pe_id}] per-lane ACCUMs:")
-    for lane, a in enumerate(accums):
-        print(f"  lane#{lane} = {dict(sorted(a.items()))}")
-    print(f"[PE#{pe_id}] combined ACCUM = {dict(sorted(combined.items()))}")
+    if _VERBOSE:
+        print(f"[PE#{pe_id}] per-lane ACCUMs:")
+        for lane, a in enumerate(accums):
+            print(f"  lane#{lane} = {dict(sorted(a.items()))}")
+        print(f"[PE#{pe_id}] combined ACCUM = {dict(sorted(combined.items()))}")
     return combined
 
 
@@ -303,22 +334,23 @@ def pe_process_v2(fifo_b, wsps, sparse_weights_list, pe_id=0):
     return a list of K ACCUM dicts (NOT summed).
     """
     K = len(wsps)
-    print(f"[PE-v2#{pe_id}] lanes={K}, stream_len={len(fifo_b)}")
+    if _VERBOSE: print(f"[PE-v2#{pe_id}] lanes={K}, stream_len={len(fifo_b)}")
 
     curr = [(sw[0] if sw else (None, None)) for sw in sparse_weights_list]
     nxt  = [(sw[1] if len(sw) >= 2 else (None, None)) for sw in sparse_weights_list]
     cursors = [2] * K
     accums = [{} for _ in range(K)]
 
-    for lane in range(K):
-        print(f"  lane#{lane} init Curr=(PID={curr[lane][0]}, w={curr[lane][1]}) "
-              f"Next=(PID={nxt[lane][0]}, w={nxt[lane][1]}) wsp={wsps[lane]}")
+    if _VERBOSE:
+        for lane in range(K):
+            print(f"  lane#{lane} init Curr=(PID={curr[lane][0]}, w={curr[lane][1]}) "
+                  f"Next=(PID={nxt[lane][0]}, w={nxt[lane][1]}) wsp={wsps[lane]}")
 
     for cycle, (axy, cid, pid) in enumerate(fifo_b, start=1):
-        print(f"  cyc#{cycle} ACT={axy} CID={cid} PID={pid}")
+        if _VERBOSE: print(f"  cyc#{cycle} ACT={axy} CID={cid} PID={pid}")
         for lane in range(K):
             if wsps[lane][pid] != 1:
-                print(f"    lane#{lane} IDLE  (WSP_{lane}[{pid}]=0)")
+                if _VERBOSE: print(f"    lane#{lane} IDLE  (WSP_{lane}[{pid}]=0)")
                 continue
 
             if curr[lane][0] != pid:
@@ -336,13 +368,15 @@ def pe_process_v2(fifo_b, wsps, sparse_weights_list, pe_id=0):
             wgt = curr[lane][1]
             prod = axy * wgt
             accums[lane][cid] = accums[lane].get(cid, 0) + prod
-            print(f"    lane#{lane} {action} | Curr=(PID={curr[lane][0]}, w={wgt}) "
-                  f"Next=(PID={nxt[lane][0]}, w={nxt[lane][1]}) "
-                  f"| {axy}*{wgt}={prod} -> ACCUM_{lane}[{cid}]={accums[lane][cid]}")
+            if _VERBOSE:
+                print(f"    lane#{lane} {action} | Curr=(PID={curr[lane][0]}, w={wgt}) "
+                      f"Next=(PID={nxt[lane][0]}, w={nxt[lane][1]}) "
+                      f"| {axy}*{wgt}={prod} -> ACCUM_{lane}[{cid}]={accums[lane][cid]}")
 
-    print(f"[PE-v2#{pe_id}] per-lane ACCUMs:")
-    for lane, a in enumerate(accums):
-        print(f"  lane#{lane} = {dict(sorted(a.items()))}")
+    if _VERBOSE:
+        print(f"[PE-v2#{pe_id}] per-lane ACCUMs:")
+        for lane, a in enumerate(accums):
+            print(f"  lane#{lane} = {dict(sorted(a.items()))}")
     return accums
 
 
@@ -465,7 +499,8 @@ def gospa_conv2d(activation, kernel, stride):
 # ---------------------------------------------------------------------------
 
 def goSPA_run(activation, kernels, stride,
-              num_pes=8, num_mults=4, interpretation="v1"):
+              num_pes=8, num_mults=4, interpretation="v1",
+              initial_outputs=None, verbose=False):
     """
     Run a full conv layer on a goSPA accelerator with `num_pes` PEs of
     `num_mults` multipliers each.
@@ -478,10 +513,13 @@ def goSPA_run(activation, kernels, stride,
             Each PE uses pe_process_v2 (one activation/cycle, lanes idle when
             their WSP[PID]=0).
 
+    `initial_outputs`: optional list of ExE matrices, one per kernel. If
+    provided, each PE accumulator is treated as if it already held these
+    values (models retaining the PE's CID-indexed accumulator across
+    multiple input-channel passes). Defaults to None (start at zero).
+
     Returns one ExE output map per kernel, in the same order as `kernels`.
     """
-    import contextlib, io
-
     H = len(activation)
     F = len(kernels[0])
     E = (H - F) // stride + 1
@@ -512,8 +550,7 @@ def goSPA_run(activation, kernels, stride,
                 pe_chunks.append(chunk)
         pe_wsps = [wsp_union([wsps[k] for k in c]) for c in pe_chunks]
 
-    sink = io.StringIO()
-    with contextlib.redirect_stdout(sink):
+    with _quiet():
         positional = csr_to_positional(values, col_idx, row_ptr)
         decoded = [axy_to_pcid(axy, x, y, stride) for (axy, x, y) in positional]
         pairs = []
@@ -527,8 +564,12 @@ def goSPA_run(activation, kernels, stride,
     print(f"  non-zero activations after Stage 1 filter = {len(filtered)}")
     for pe, chunk in enumerate(pe_chunks):
         fb = fifo_b_list[pe]
-        print(f"  PE#{pe}: kernels={chunk}, |FIFO-B|={len(fb)}")
-        with contextlib.redirect_stdout(sink):
+        detail = (verbose and interpretation == "v2" and pe == 1)
+        if detail:
+            print(f"  PE#{pe}: kernels={chunk}")
+        else:
+            print(f"  PE#{pe}: kernels={chunk}, |FIFO-B|={len(fb)}")
+        with _quiet():
             if interpretation == "v1":
                 k = chunk[0]
                 accum = pe_process(fb, sw_lists[k],
@@ -542,6 +583,60 @@ def goSPA_run(activation, kernels, stride,
                 for lane, k in enumerate(chunk):
                     outputs[k] = accum_to_matrix(accums[lane], E)
 
+        if detail:
+            for lane, k in enumerate(chunk):
+                # cumulative ACCUM = this-channel partials + any prior channels
+                if initial_outputs is not None:
+                    cumul = [[outputs[k][i][j] + initial_outputs[k][i][j]
+                              for j in range(E)] for i in range(E)]
+                else:
+                    cumul = outputs[k]
+                kw = max(2, max(len(str(v)) for row in kernels[k] for v in row))
+                aw = max(2, max(len(str(v)) for row in cumul for v in row))
+                print(f"    lane#{lane} (out-channel {k}):")
+                print(f"      kernel ({F}x{F}):")
+                for row in kernels[k]:
+                    print("        " + " ".join(f"{v:>{kw}d}" for v in row))
+                print(f"      ACCUM file ({E}x{E}, CID = row*{E} + col):")
+                for row in cumul:
+                    print("        " + " ".join(f"{v:>{aw}d}" for v in row))
+
+    if initial_outputs is not None:
+        for oc in range(K):
+            for i in range(E):
+                for j in range(E):
+                    outputs[oc][i][j] += initial_outputs[oc][i][j]
+
+    return outputs
+
+
+def goSPA_multichannel(activations, kernels_full, stride,
+                       num_pes=8, num_mults=4, interpretation="v1",
+                       verbose=False):
+    """
+    Multi-input-channel conv on goSPA. The PE accumulators are kept across
+    input-channel iterations (modeled here by threading `initial_outputs`).
+
+        activations  : list of C_in 2D activation maps (each H x H).
+        kernels_full : list of C_out kernels; each entry is a list of C_in
+                       FxF slices, so kernels_full[oc][ic] is the slice for
+                       output channel oc, input channel ic.
+
+    Returns C_out output maps (ExE each), with sums over all input channels.
+    """
+    C_in = len(activations)
+    C_out = len(kernels_full)
+    if any(len(k) != C_in for k in kernels_full):
+        raise ValueError("each kernel must have a slice per input channel")
+
+    outputs = None
+    for ic in range(C_in):
+        kernels_ic = [kernels_full[oc][ic] for oc in range(C_out)]
+        print(f"--- input channel {ic+1}/{C_in} ---")
+        outputs = goSPA_run(activations[ic], kernels_ic, stride,
+                            num_pes=num_pes, num_mults=num_mults,
+                            interpretation=interpretation,
+                            initial_outputs=outputs, verbose=verbose)
     return outputs
 
 
@@ -689,18 +784,23 @@ if __name__ == "__main__":
                    for f in range(int_w.shape[0])]
     print(f"  loaded {len(red_kernels)} red-channel 3x3 kernels from MobileNetV2 first conv")
 
-    # 9x9 sparse INT8 activation; with F=3, S=2 -> E=4 (4x4 outputs).
-    activation_red = [
-        [10,  0,  0,  0, 20,  0,  0, 30,  0],
-        [ 0, 15,  0, 25,  0,  0,  0,  0, 35],
-        [ 5,  0, 12,  0,  0, 28,  0, 40,  0],
-        [ 0,  0,  0, 18,  0,  0, 22,  0, 50],
-        [ 0,  8,  0,  0, 14,  0,  0,  0,  0],
-        [33,  0,  0, 11,  0, 45,  0,  0,  0],
-        [ 0,  0, 27,  0,  0,  0, 16,  0, 19],
-        [ 7,  0,  0,  0, 60,  0,  0, 24,  0],
-        [ 0, 13,  0, 38,  0,  0, 42,  0,  9],
-    ]
+    # Realistic MobileNetV2 input: 224x224 single-channel (red) INT8 activation.
+    # We zero-pad to 226x226 to mirror the conv's padding=1, so with F=3, S=2
+    # we get E = (226-3)/2 + 1 = 112  -- matches the network's spec.
+    import random
+    rng = random.Random(0)
+    H_RAW = 96
+    SPARSITY = 0.5  # post-quantization activations: very rough placeholder
+    raw_red = [[0 if rng.random() < SPARSITY else rng.randint(-128, 127)
+                for _ in range(H_RAW)] for _ in range(H_RAW)]
+    # Manual zero-padding (padding=1 on all sides) -> 226x226.
+    PAD = 1
+    H_PAD = H_RAW + 2 * PAD
+    activation_red = [[0] * H_PAD]
+    for row in raw_red:
+        activation_red.append([0] + list(row) + [0])
+    activation_red.append([0] * H_PAD)
+
     NUM_PES, NUM_MULTS, STRIDE = 8, 4, 2
 
     # Independent ground truth via PyTorch's conv2d (cross-correlation, no flip
@@ -714,19 +814,6 @@ if __name__ == "__main__":
         out_t = Fnn.conv2d(act_t, ker_t, stride=stride, padding=0).squeeze(0)
         return [out_t[c].int().tolist() for c in range(out_t.shape[0])]
 
-    print("\n-- v1 mapping: PE#k = filter[k]'s red channel (filters 0..7) --")
-    out_v1 = goSPA_run(activation_red, red_kernels[:NUM_PES], stride=STRIDE,
-                      num_pes=NUM_PES, num_mults=NUM_MULTS, interpretation="v1")
-    refs_v1 = [conv2d_reference(activation_red, k, STRIDE)
-               for k in red_kernels[:NUM_PES]]
-    torch_v1 = torch_conv_ref(activation_red, red_kernels[:NUM_PES], STRIDE)
-    ok_v1_ref = (out_v1 == refs_v1)
-    ok_v1_torch = (out_v1 == torch_v1)
-    ok_ref_torch_v1 = (refs_v1 == torch_v1)
-    print(f"  v1 vs Python ref : {ok_v1_ref}")
-    print(f"  v1 vs PyTorch    : {ok_v1_torch}")
-    print(f"  Python ref vs PyTorch: {ok_ref_torch_v1}")
-
     print(f"\n-- v2 mapping: 32 filters' red channel across "
           f"{NUM_PES} PEs x {NUM_MULTS} lanes --")
     out_v2 = goSPA_run(activation_red, red_kernels, stride=STRIDE,
@@ -735,11 +822,103 @@ if __name__ == "__main__":
     torch_v2 = torch_conv_ref(activation_red, red_kernels, STRIDE)
     ok_v2_ref = (out_v2 == refs_v2)
     ok_v2_torch = (out_v2 == torch_v2)
-    ok_ref_torch_v2 = (refs_v2 == torch_v2)
     print(f"  v2 vs Python ref : {ok_v2_ref}")
     print(f"  v2 vs PyTorch    : {ok_v2_torch}")
-    print(f"  Python ref vs PyTorch: {ok_ref_torch_v2}")
 
     print(f"\nMobileNet goSPA mapping (vs PyTorch): "
-          f"v1={'PASS' if ok_v1_torch else 'FAIL'}, "
           f"v2={'PASS' if ok_v2_torch else 'FAIL'}")
+
+    # ---- Full 3-input-channel conv: accumulators persist across input channels ----
+    print("\n=== goSPA: MobileNetV2 first conv, all 3 input channels (RGB) ===")
+    # Build 3 padded input channels (G and B with different seeds so they differ).
+    def _padded_channel(seed):
+        r = random.Random(seed)
+        raw = [[0 if r.random() < SPARSITY else r.randint(-128, 127)
+                for _ in range(H_RAW)] for _ in range(H_RAW)]
+        pad = [[0] * H_PAD]
+        for row in raw:
+            pad.append([0] + list(row) + [0])
+        pad.append([0] * H_PAD)
+        return pad
+
+    activations_rgb = [activation_red,           # ic=0 reuses the red channel above
+                       _padded_channel(seed=1),  # ic=1
+                       _padded_channel(seed=2)]  # ic=2
+
+    # Full 4D kernel: (32 output channels, 3 input channels, 3, 3)
+    full_kernels = [
+        [[[int(v) for v in row] for row in int_w[oc, ic]]
+         for ic in range(int_w.shape[1])]
+        for oc in range(int_w.shape[0])
+    ]
+
+    # v2: 8 PEs x 4 lanes -> 32 output channels (all filters), summed over 3 inputs
+    print("\n-- v2: 3 input channels x 32 output channels --")
+    out_v2_mc = goSPA_multichannel(activations_rgb, full_kernels, STRIDE,
+                                   num_pes=NUM_PES, num_mults=NUM_MULTS,
+                                   interpretation="v2")
+    act_3ch = torch.tensor(activations_rgb, dtype=torch.float32).unsqueeze(0)  # (1,3,H,H)
+    ker_v2_mc = torch.tensor(full_kernels, dtype=torch.float32)                # (32,3,3,3)
+    torch_v2_mc_t = Fnn.conv2d(act_3ch, ker_v2_mc, stride=STRIDE, padding=0).squeeze(0)
+    torch_v2_mc = [torch_v2_mc_t[c].int().tolist() for c in range(torch_v2_mc_t.shape[0])]
+    ok_v2_mc = (out_v2_mc == torch_v2_mc)
+    print(f"  v2 multi-channel vs PyTorch: {ok_v2_mc}")
+
+    print(f"\nMobileNet RGB conv on goSPA (vs PyTorch): "
+          f"v2={'PASS' if ok_v2_mc else 'FAIL'}")
+
+    # ---- End-to-end against MobileNetV2's first_conv module ----
+    # The module is QuantizedConvReLU2d, so the full pipeline is:
+    #   acc   = sum((q_a - z_a) * q_w)
+    #   floaty = acc * s_a * s_w + bias
+    #   relu  = max(floaty, 0)
+    #   q_y   = round(relu / s_y) + z_y, clamped to quint8
+    print("\n=== End-to-end vs first_conv module (with bias/ReLU/requant) ===")
+    s_a, z_a = 0.01, 0
+    rng2 = random.Random(7)
+    q_a_int_np = [[[rng2.randint(0, 80) if rng2.random() > 0.5 else 0
+                    for _ in range(H_RAW)] for _ in range(H_RAW)]
+                  for _ in range(3)]
+    q_a_int = torch.tensor(q_a_int_np, dtype=torch.uint8).unsqueeze(0)  # (1,3,H,H)
+    q_a = torch._make_per_tensor_quantized_tensor(q_a_int, s_a, z_a)
+    with torch.no_grad():
+        q_y = conv0(q_a)
+    y_actual = q_y.int_repr()[0]  # (32, E, E) uint8
+
+    # Pad with z_a (= 0 here) and feed each channel into goSPA
+    padded = torch.zeros(1, 3, H_PAD, H_PAD, dtype=torch.int32)
+    padded[:, :, PAD:-PAD, PAD:-PAD] = q_a_int.int() - z_a
+    activations_3ch_q = [padded[0, c].tolist() for c in range(3)]
+    full_kernels_int = [[[[int(v) for v in row] for row in int_w[oc, ic]]
+                         for ic in range(int_w.shape[1])]
+                        for oc in range(int_w.shape[0])]
+
+    acc_lists = goSPA_multichannel(activations_3ch_q, full_kernels_int,
+                                   stride=STRIDE, num_pes=NUM_PES,
+                                   num_mults=NUM_MULTS, interpretation="v2")
+    acc_t = torch.tensor(acc_lists, dtype=torch.int32)  # (32, E, E)
+
+    s_w = conv0.weight().q_scale()
+    s_y = conv0.scale
+    z_y = conv0.zero_point
+    bias = conv0.bias()  # float32 or None
+
+    # PyTorch's QConv pre-quantizes bias to int32 (units of s_a*s_w) and adds
+    # it to the int accumulator before the float-rescale step. Mirror that.
+    s_aw = s_a * s_w
+    if bias is not None:
+        bias_int = torch.round(bias / s_aw).to(torch.int32)
+        acc_t = acc_t + bias_int[:, None, None]
+    y_float = acc_t.float() * s_aw
+    y_float = torch.clamp(y_float, min=0.0)  # ReLU
+    y_quant = torch.quantize_per_tensor(y_float, s_y, z_y, torch.quint8)
+    y_pred = y_quant.int_repr()
+
+    exact = bool((y_pred == y_actual).all().item())
+    n_match = int((y_pred == y_actual).sum().item())
+    n_total = int(y_actual.numel())
+    diff = (y_pred.int() - y_actual.int()).abs()
+    print(f"  match {n_match}/{n_total} = {n_match/n_total:.4%}")
+    print(f"  exact match against first_conv output: {exact}")
+    print(f"  diff histogram: 0={int((diff==0).sum())} 1={int((diff==1).sum())} "
+          f">=2={int((diff>=2).sum())}, max diff={int(diff.max())}")

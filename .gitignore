@@ -6,3 +6,8 @@ obj_dir/
 *.fst
 *.lxt
 *.vvp
+
+# Python
+.venv/
+__pycache__/
+*.pyc
