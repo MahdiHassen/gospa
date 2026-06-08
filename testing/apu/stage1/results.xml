@@ -1,0 +1,13 @@
+<testsuites name="results">
+  <testsuite name="all" package="all">
+    <property name="random_seed" value="1780891618" />
+    <testcase name="test_single_entry" classname="test_csr_decode" file="/media/esarkar/DATADisk/ECE720_labs_HW_ML/project/team-19/testing/apu/stage1/test_csr_decode.py" lineno="156" time="0.0013306140899658203" sim_time_ns="100.001" ratio_time="75154.02155599355" />
+    <testcase name="test_multi_in_one_row" classname="test_csr_decode" file="/media/esarkar/DATADisk/ECE720_labs_HW_ML/project/team-19/testing/apu/stage1/test_csr_decode.py" lineno="174" time="0.0011746883392333984" sim_time_ns="130.001" ratio_time="110668.50300466816" />
+    <testcase name="test_empty_rows_skipped" classname="test_csr_decode" file="/media/esarkar/DATADisk/ECE720_labs_HW_ML/project/team-19/testing/apu/stage1/test_csr_decode.py" lineno="190" time="0.001252889633178711" sim_time_ns="120.00099999999998" ratio_time="95779.38616631777" />
+    <testcase name="test_all_empty" classname="test_csr_decode" file="/media/esarkar/DATADisk/ECE720_labs_HW_ML/project/team-19/testing/apu/stage1/test_csr_decode.py" lineno="206" time="0.0021429061889648438" sim_time_ns="300.00100000000003" ratio_time="139997.2623836226" />
+    <testcase name="test_all_rows_populated" classname="test_csr_decode" file="/media/esarkar/DATADisk/ECE720_labs_HW_ML/project/team-19/testing/apu/stage1/test_csr_decode.py" lineno="241" time="0.0010731220245361328" sim_time_ns="140.00099999999998" ratio_time="130461.39842346143" />
+    <testcase name="test_backpressure" classname="test_csr_decode" file="/media/esarkar/DATADisk/ECE720_labs_HW_ML/project/team-19/testing/apu/stage1/test_csr_decode.py" lineno="257" time="0.001252889633178711" sim_time_ns="170.00099999999998" ratio_time="135687.13117107516" />
+    <testcase name="test_random_8x8" classname="test_csr_decode" file="/media/esarkar/DATADisk/ECE720_labs_HW_ML/project/team-19/testing/apu/stage1/test_csr_decode.py" lineno="278" time="0.0024480819702148438" sim_time_ns="300.0010000000001" ratio_time="122545.32472769773" />
+    <testcase name="test_reset_mid_stream" classname="test_csr_decode" file="/media/esarkar/DATADisk/ECE720_labs_HW_ML/project/team-19/testing/apu/stage1/test_csr_decode.py" lineno="309" time="0.0010466575622558594" sim_time_ns="150.00099999999998" ratio_time="143314.30394168562" />
+  </testsuite>
+</testsuites>
