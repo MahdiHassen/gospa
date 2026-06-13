@@ -15,14 +15,30 @@ existing `sw/functional.py` is the **functional** golden model and is left as-is
 
 ## 1. Scope and relationship to the functional model
 
-`functional.py` correctly implements the GoSPA *algorithm* for a single input and
-single output channel: CSR decode → `(Px,Py,Cx,Cy)` → `(CID,PID)` enumeration →
-FIFO-A routing → WSP-gated broadcast → PE accumulate.
+`functional.py` implements the full GoSPA *algorithm* and is **no longer limited to a
+single PE / single channel.** Bottom-up it provides:
+- the per-stage front end — CSR decode (`csr_to_positional`) → `(Px,Py,Cx,Cy)`
+  (`axy_to_pcid`) → `(CID,PID)` enumeration (`pcid_to_cid_pid`) → zero filter →
+  FIFO-A routing (`route_to_fifo_a`) → WSP-gated broadcast (`broadcast_to_fifo_b`);
+- the **multi-PE accelerator** `goSPA_run(..., num_pes, num_mults, interpretation)`:
+  it packs output channels onto an `N_PE × M` array and routes the *real* FIFO-B
+  stream to each PE (v2: up to `num_pes·num_mults` kernels, one per lane, each PE
+  gated by the **union** of its lanes' WSPs);
+- **multi-input-channel** convolution `goSPA_multichannel(...)`, which threads
+  `initial_outputs` so each PE's CID-indexed accumulator **persists across input
+  channels** (partial sums stay resident and are summed over `Cin`).
+
+Verified end-to-end against PyTorch on MobileNetV2's first conv (RGB, 32 output
+channels, including the quantize/bias/ReLU/requant tail).
 
 The perf model **reuses the correct front-end stages** (CSR decode, ID generation,
-FIFO-A routing — Figs. 5/6) but **does not reuse `pe_process`**, because that
-function models the PE multipliers along the wrong axis (see §2). The perf model
-implements its own corrected PE assignment (union-of-WSP gating) and PE timing.
+FIFO-A routing — Figs. 5/6) and the **corrected v2 PE dataflow** that already exists
+in `functional.py` (`pe_process_v2` / `goSPA_run(interpretation="v2")`: M kernels per
+PE, union-of-WSP FIFO-B gating). It **does not reuse `pe_process`** (v1), because that
+function models the PE multipliers along the wrong axis (see §2). Rather than
+reimplement the v2 dataflow, the PE perf model is an **instrumentation layer** over
+it: it walks the already-routed `fifo_b` and counts cycles/utilization — it does not
+recompute MACs. Implemented in `perf_pe.py`.
 
 ---
 
@@ -46,10 +62,20 @@ not across activations. This corrects an assumption baked into
   `lane_utilization = useful_MACs / (PE_cycles × M)`.
 - **Weight reuse / reordering** (`Curr`/`Next`) operates on a **column of `M`
   weights per PID**: same-PID activations are batched so the column stays resident
-  and is reused; a reload penalty `W_UPDATE_PENALTY` is charged on PID change.
+  and is reused. A `Curr`/`Next` **double buffer** prefetches the next column, so a
+  PID change is *hidden* when the current PID's run is long enough to cover the
+  fetch. The reload penalty **scales with `M`** (the column size):
+  `P = W_FETCH_LATENCY + ceil(M / W_FETCH_BW)` (defaults give `P = M`). §4 shows how
+  the stall is charged. *(In `pe_process_v2` each lane advances its **own** sparse
+  weight stream and reloads only when it is active at a new PID; the perf model
+  abstracts these independent per-lane updates as one M-wide column reload at each
+  PID-group boundary — matching the hardware's `Curr`/`Next` column double-buffer.)*
 - **Throughput:** **1 activation / cycle / PE.**
-- **Output-channel tiling:** `Cout` is mapped across `N_PE × M` channels per pass;
-  `ceil(Cout / (N_PE·M))` passes per layer.
+- **Output-channel tiling:** one pass packs up to `N_PE × M` output channels.
+  `goSPA_run(interpretation="v2")` **already does this packing** (PE `k` gets kernels
+  `[k·M : (k+1)·M]`, union-WSP per PE; the last PE may be partially filled, so its
+  effective lane count `M_eff < M`). It *raises* if `Cout` exceeds `N_PE·M`, so the
+  **perf model adds only the pass loop** `ceil(Cout / (N_PE·M))` on top.
 
 ---
 
@@ -81,16 +107,24 @@ Run the functional pass to obtain, per layer/pass: the decoded `(CID,PID)` pair
 stream, the F²×FIFO-A contents, and `fifo_b[k]` for each PE `k`.
 
 - **APU Stage 1 (ID-gen):** ~1 non-zero activation decoded/cycle, each emitting up
-  to `G² = (F/S)²` `(CID,PID)` pairs.
+  to `G²` `(CID,PID)` pairs, where `G = ceil(F/S)` (the model uses `ceil`, not
+  `floor` — an `F`-not-divisible-by-`S` kernel must still reach its last row/col).
+  The *actual* count is `≤ G²`: the `E`-range and `F`-range gates in
+  `pcid_to_cid_pid` drop out-of-bounds `(m,n)`.
   `stage1 ≈ Σ_nz (1 + pairs_emitted)` (or `max(#nz, #pairs)` if the enumerator is
   unrolled — config knob). Input rate is bounded by activation read bandwidth.
 - **APU Stage 2 (router/broadcast):** drains FIFO-A in PID order, ~1 entry
   broadcast/cycle (fan-out to matching PEs is parallel).
   `stage2 ≈ Σ_pid len(FIFO_A[pid])`.
-- **PE (usual bottleneck):** for each PE walk `fifo_b[k]`; 1 activation/cycle, plus a
-  reload on PID change:
-  `pe_cycles(k) ≈ len(fifo_b[k]) + (#PID_changes_in_k × W_UPDATE_PENALTY)`.
-  `pe_stage = max_k pe_cycles(k)`  ← load imbalance.
+- **PE (usual bottleneck):** for each PE walk `fifo_b[k]`; 1 activation/cycle, plus
+  reload stalls on PID change. With the `Curr`/`Next` double buffer (the default,
+  faithful model) a reload is hidden behind the previous PID's run:
+  `pe_cycles(k) = len(fifo_b[k]) + Σ_{i≥1} max(0, P − run_len(group_{i-1}))`,
+  where the groups are the contiguous same-PID runs (FIFO-B is PID-ordered out of
+  Stage 2) and `P` is the M-scaled penalty from §2. A `simple` model
+  (`+ #PID_changes × P`, no hiding) and an `ideal` model (no stall) are kept as
+  analysis knobs. `pe_stage = max_k pe_cycles(k)`  ← load imbalance.
+  *(Implemented in `perf_pe.py:pe_perf_from_stream`.)*
 - **Memory (fixed-latency + bandwidth, matches RTL):**
   `mem_cycles = ceil(bytes_moved / B) + L` for activation loads, weight loads, and
   output stores. 1×1 and depthwise layers are the bandwidth-bound stress cases.
@@ -109,14 +143,20 @@ config constants to be calibrated against RTL.
 
 ## 5. Scaling to real layers
 
-`functional.py` is single in/out channel; the perf model adds:
+`functional.py` already covers multi-PE packing (`goSPA_run`) and input-channel
+accumulation with resident accumulators (`goSPA_multichannel`). On top of that the
+perf model adds:
 - **`Layer` descriptor:** `H, W, F, S, pad, Cin, Cout, type ∈ {conv, 1x1, dw, fc}`.
-- **Input-channel accumulation** over `Cin`; **output-channel tiling** over
-  `N_PE × M` (§2).
-- A **stats-only fast path** alongside the full functional path: for large layers we
-  derive per-PE FIFO-B lengths and PID-change counts from sparsity without
-  materializing every MAC (keeps full-network sweeps fast); the full path is used
-  for small correctness/spot-check cases.
+- **Output-channel pass loop:** `ceil(Cout / (N_PE·M))` passes, since one `goSPA_run`
+  packs at most `N_PE·M` channels (§2).
+- **Input-channel accumulation is reused** from `goSPA_multichannel`: the CID-indexed
+  accumulators stay resident across `Cin` (threaded via `initial_outputs`), so there
+  is **no extra readout/reload between input channels** — each input channel just adds
+  another front-end pass over the same PEs.
+- **Stream-only accounting:** the perf model runs the real functional routing and
+  walks the materialized `fifo_b` per PE (the stream entry point in `perf_pe.py`).
+  *(The earlier "stats-only occupancy fast path" is dropped — the model reports the
+  architecture's real routed behavior, it does not model an optimized variant.)*
 
 ---
 
@@ -140,8 +180,12 @@ functional.py     # exists — golden functional model (left as-is)
 config.py         # HwConfig dataclass: N_PE, M (mults/PE), FREQ_HZ,
                   #   FIFO_A_DEPTH/FIFO_B_DEPTH, W_UPDATE_PENALTY, FILL/DRAIN,
                   #   ACT_W/PID_W/CID_W, mem latency L / bandwidth B
-layer.py          # Layer descriptor + multi-channel / tiling iteration
-perf_model.py     # corrected PE assignment (union-WSP) + per-stage cycle counting
+layer.py          # Layer descriptor + output-channel pass loop;
+                  #   reuses goSPA_multichannel for Cin accumulation
+perf_pe.py        # DONE: single-PE timing — instruments the v2 PE; double-buffer
+                  #   reload model, M-scaled penalty, lane-utilization stats
+perf_model.py     # per-stage (APU1/APU2/mem) counting + multi-PE aggregation
+                  #   (max_k pe_cycles, FILL/DRAIN); calls perf_pe per PE
 sparsity.py       # synthetic providers now; PyTorch-captured real later
 workloads/        # alexnet.py, vgg16.py, ... as Layer lists
 sim.py            # driver: network -> per-layer & total cycles, latency, FPS,
@@ -190,8 +234,45 @@ one-line change.
 
 ## 11. Build order (next milestones)
 
-1. `config.py` — `HwConfig` with all knobs (placeholder defaults + TODOs).
-2. `perf_model.py` — corrected PE assignment + §4 stage counters; validate on the
-   three cases already in `functional.py`.
-3. `layer.py` + tiling — lift to multi-channel / multi-PE.
-4. `sim.py` + AlexNet end-to-end with synthetic sparsity; then wire in real sparsity.
+Single-pass `N_PE×M` packing are **reused** from `functional.py`, not rebuilt here.
+
+1. **`config.py`** — `HwConfig` parameter bag: all knobs (`N_PE`, `M`, `FREQ_HZ`,
+   `FIFO_A/B_DEPTH`, `W_UPDATE_PENALTY` / `W_FETCH_LATENCY` / `W_FETCH_BW`,
+   `FILL`/`DRAIN`, mem `L`/`B`, `ACT_W`/`PID_W`/`CID_W`). Placeholder defaults + TODOs
+   (§10). Small prerequisite for everything below.
+
+2. **`perf_pe.py`** — **DONE**: single-PE timing (stream entry point). Instruments the
+   v2 PE; double-buffer reload, M-scaled penalty, lane-utilization stats. Validated by
+   its own self-test (Fig.13 replay, roofline, double-buffer stalls, union
+   under-utilization) and cross-checked on a real routed `fifo_b` from `functional.py`.
+
+3. **`perf_model.py`** — the per-pass engine. Drives the real functional
+   routing (`csr_to_positional → … → broadcast_to_fifo_b`, via `goSPA_run`) to obtain
+   the per-PE `fifo_b`, counts APU-Stage-1 / Stage-2 / memory (§4), calls `perf_pe`
+   per PE, and rolls up `pe_stage = max_k pe_cycles` + `FILL`/`DRAIN` into one pass's
+   cycle count. Validate against the small cases + the MobileNet case in
+   `functional.py`.
+
+4. **`layer.py`** — `Layer` descriptor (§5) plus the two outer loops `perf_model`
+   doesn't own: the **output-channel pass loop** `ceil(Cout/(N_PE·M))`, and
+   **input-channel accumulation** delegated to `goSPA_multichannel` (accumulators stay
+   resident — no inter-channel reload to charge). Expands a `Layer` into the sequence
+   of passes `perf_model` scores.
+
+5. **`sparsity.py`** — sparsity providers: synthetic `d_a`/`d_w` (Bernoulli /
+   structured) now for bring-up; PyTorch-captured real maps later (§6).
+
+6. **`workloads/`** — networks as `Layer` lists (`alexnet.py`, `vgg16.py`, …). Data
+   only, no logic.
+
+7. **`sim.py`** — top driver: run a workload through `layer` + `perf_model`, sum to
+   total cycles → latency/FPS, report lane utilization, per-PE load-imbalance factor,
+   and **speedup vs. dense** (§8). AlexNet end-to-end with synthetic sparsity first,
+   then wire in real sparsity.
+
+8. **`tests/`** — unit tests: per-stage cycle counts + the §9 invariants (density=1
+   roofline, single-nonzero floor, front-end structures match `functional.py`).
+   Generalizes `perf_pe.py`'s inline self-test.
+
+**Critical path to a first end-to-end number: 3 → 4 → 7** (with 1 as prerequisite).
+Steps 5, 6, and 8 can land in parallel.
