@@ -14,6 +14,7 @@ prints so we can checkpoint functional correctness as we go.
 """
 
 import contextlib
+from collections import namedtuple
 
 
 # Global verbosity flag. Pipeline functions guard their hot-loop prints with
@@ -498,27 +499,34 @@ def gospa_conv2d(activation, kernel, stride):
 # goSPA accelerator (multi-PE)
 # ---------------------------------------------------------------------------
 
-def goSPA_run(activation, kernels, stride,
-              num_pes=8, num_mults=4, interpretation="v1",
-              initial_outputs=None, verbose=False):
+# Lightweight container for the routed structures produced by the front end.
+# Returned by `goSPA_route` and consumed both by `goSPA_run` (to run the PEs)
+# and by the performance model (to instrument timing over the real FIFO-B
+# streams -- see sw/perf_pe.py and sw/perf_model.py).
+Routing = namedtuple("Routing", [
+    "fifo_b_list",  # per-PE [(Axy, CID, PID), ...], PID-ordered (Stage 2 out)
+    "pe_chunks",    # per-PE list of the output-channel ids that PE handles
+    "wsps",         # per output-channel WSP bit-array (length F^2)
+    "sw_lists",     # per output-channel sparse weight stream [(PID, w), ...]
+    "n_nz",         # non-zero activations decoded (Stage 1 input count)
+    "n_pairs",      # (CID,PID) pairs emitted == sum_pid len(FIFO_A[pid])
+    "E",            # output map dimension (E x E)
+])
+
+
+def goSPA_route(activation, kernels, stride,
+                num_pes=8, num_mults=4, interpretation="v1"):
     """
-    Run a full conv layer on a goSPA accelerator with `num_pes` PEs of
-    `num_mults` multipliers each.
+    Run only the goSPA front end (APU Stage 1 + Stage 2) and return the routed
+    data structures, WITHOUT running the PEs. This is the shared routing core
+    of `goSPA_run`; the performance model calls it to count cycles over the
+    *real* routed FIFO-B streams rather than re-implementing the dataflow.
 
-    Mapping policies:
-      "v1": one kernel per PE; needs len(kernels) <= num_pes.
-            Each PE uses pe_process (same-PID batching across `num_mults`).
-      "v2": up to `num_mults` kernels per PE (one per lane); needs
-            len(kernels) <= num_pes * num_mults.
-            Each PE uses pe_process_v2 (one activation/cycle, lanes idle when
-            their WSP[PID]=0).
+    Mapping policy matches `goSPA_run`:
+      "v1": one kernel per PE   (gating WSP = that kernel's WSP).
+      "v2": up to `num_mults` kernels per PE (gating WSP = union of the chunk).
 
-    `initial_outputs`: optional list of ExE matrices, one per kernel. If
-    provided, each PE accumulator is treated as if it already held these
-    values (models retaining the PE's CID-indexed accumulator across
-    multiple input-channel passes). Defaults to None (start at zero).
-
-    Returns one ExE output map per kernel, in the same order as `kernels`.
+    Pure and silent: no prints, no PE compute. Returns a `Routing`.
     """
     H = len(activation)
     F = len(kernels[0])
@@ -528,9 +536,6 @@ def goSPA_run(activation, kernels, stride,
     cap = num_pes if interpretation == "v1" else num_pes * num_mults
     if K > cap:
         raise ValueError(f"{interpretation}: capacity is {cap} kernels, got {K}")
-
-    print(f"[goSPA] {num_pes} PEs x {num_mults} mults | mode={interpretation} "
-          f"| H={H}, F={F}, S={stride} -> E={E} | {K} output channels")
 
     values, col_idx, row_ptr = dense_to_csr(activation)
     wsps, sw_lists = [], []
@@ -560,10 +565,55 @@ def goSPA_run(activation, kernels, stride,
         fifo_a = route_to_fifo_a(filtered, F=F)
         fifo_b_list = broadcast_to_fifo_b(fifo_a, pe_wsps)
 
+    return Routing(
+        fifo_b_list=fifo_b_list,
+        pe_chunks=pe_chunks,
+        wsps=wsps,
+        sw_lists=sw_lists,
+        n_nz=len(positional),
+        n_pairs=len(filtered),
+        E=E,
+    )
+
+
+def goSPA_run(activation, kernels, stride,
+              num_pes=8, num_mults=4, interpretation="v1",
+              initial_outputs=None, verbose=False):
+    """
+    Run a full conv layer on a goSPA accelerator with `num_pes` PEs of
+    `num_mults` multipliers each.
+
+    Mapping policies:
+      "v1": one kernel per PE; needs len(kernels) <= num_pes.
+            Each PE uses pe_process (same-PID batching across `num_mults`).
+      "v2": up to `num_mults` kernels per PE (one per lane); needs
+            len(kernels) <= num_pes * num_mults.
+            Each PE uses pe_process_v2 (one activation/cycle, lanes idle when
+            their WSP[PID]=0).
+
+    `initial_outputs`: optional list of ExE matrices, one per kernel. If
+    provided, each PE accumulator is treated as if it already held these
+    values (models retaining the PE's CID-indexed accumulator across
+    multiple input-channel passes). Defaults to None (start at zero).
+
+    Returns one ExE output map per kernel, in the same order as `kernels`.
+    """
+    H = len(activation)
+    F = len(kernels[0])
+    K = len(kernels)
+
+    routing = goSPA_route(activation, kernels, stride,
+                          num_pes=num_pes, num_mults=num_mults,
+                          interpretation=interpretation)
+    E = routing.E
+
+    print(f"[goSPA] {num_pes} PEs x {num_mults} mults | mode={interpretation} "
+          f"| H={H}, F={F}, S={stride} -> E={E} | {K} output channels")
+
     outputs = [None] * K
-    print(f"  non-zero activations after Stage 1 filter = {len(filtered)}")
-    for pe, chunk in enumerate(pe_chunks):
-        fb = fifo_b_list[pe]
+    print(f"  non-zero activations after Stage 1 filter = {routing.n_pairs}")
+    for pe, chunk in enumerate(routing.pe_chunks):
+        fb = routing.fifo_b_list[pe]
         detail = (verbose and interpretation == "v2" and pe == 1)
         if detail:
             print(f"  PE#{pe}: kernels={chunk}")
@@ -572,13 +622,13 @@ def goSPA_run(activation, kernels, stride,
         with _quiet():
             if interpretation == "v1":
                 k = chunk[0]
-                accum = pe_process(fb, sw_lists[k],
+                accum = pe_process(fb, routing.sw_lists[k],
                                    pe_id=pe, num_mults=num_mults)
                 outputs[k] = accum_to_matrix(accum, E)
             else:
                 accums = pe_process_v2(fb,
-                                       [wsps[k] for k in chunk],
-                                       [sw_lists[k] for k in chunk],
+                                       [routing.wsps[k] for k in chunk],
+                                       [routing.sw_lists[k] for k in chunk],
                                        pe_id=pe)
                 for lane, k in enumerate(chunk):
                     outputs[k] = accum_to_matrix(accums[lane], E)

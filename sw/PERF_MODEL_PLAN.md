@@ -176,16 +176,17 @@ perf model adds:
 ## 7. Proposed file layout (`sw/`)
 
 ```
-functional.py     # exists — golden functional model (left as-is)
-config.py         # HwConfig dataclass: N_PE, M (mults/PE), FREQ_HZ,
+functional.py     # golden functional model + goSPA_route() routing accessor
+                  #   (additive: shared front end for goSPA_run and the perf model)
+config.py         # DONE: HwConfig dataclass: N_PE, M (mults/PE), FREQ_HZ,
                   #   FIFO_A_DEPTH/FIFO_B_DEPTH, W_UPDATE_PENALTY, FILL/DRAIN,
                   #   ACT_W/PID_W/CID_W, mem latency L / bandwidth B
 layer.py          # Layer descriptor + output-channel pass loop;
                   #   reuses goSPA_multichannel for Cin accumulation
 perf_pe.py        # DONE: single-PE timing — instruments the v2 PE; double-buffer
                   #   reload model, M-scaled penalty, lane-utilization stats
-perf_model.py     # per-stage (APU1/APU2/mem) counting + multi-PE aggregation
-                  #   (max_k pe_cycles, FILL/DRAIN); calls perf_pe per PE
+perf_model.py     # DONE: per-pass (APU1/APU2/mem) counting + multi-PE aggregation
+                  #   (max_k pe_cycles); calls perf_pe per PE via goSPA_route
 sparsity.py       # synthetic providers now; PyTorch-captured real later
 workloads/        # alexnet.py, vgg16.py, ... as Layer lists
 sim.py            # driver: network -> per-layer & total cycles, latency, FPS,
@@ -236,22 +237,23 @@ one-line change.
 
 Single-pass `N_PE×M` packing are **reused** from `functional.py`, not rebuilt here.
 
-1. **`config.py`** — `HwConfig` parameter bag: all knobs (`N_PE`, `M`, `FREQ_HZ`,
-   `FIFO_A/B_DEPTH`, `W_UPDATE_PENALTY` / `W_FETCH_LATENCY` / `W_FETCH_BW`,
-   `FILL`/`DRAIN`, mem `L`/`B`, `ACT_W`/`PID_W`/`CID_W`). Placeholder defaults + TODOs
-   (§10). Small prerequisite for everything below.
+1. **`config.py`** — **DONE**: `HwConfig` parameter bag: all knobs (`N_PE`, `M`,
+   `FREQ_HZ`, `FIFO_A/B_DEPTH`, `W_UPDATE_PENALTY` / `W_FETCH_LATENCY` / `W_FETCH_BW`,
+   `RELOAD_MODEL`, `STAGE1_ENUM`, `FILL`/`DRAIN`, mem `L`/`B`/ports/byte-widths,
+   `ACT_W`/`PID_W`/`CID_W`). Placeholder defaults + TODOs (§10).
 
 2. **`perf_pe.py`** — **DONE**: single-PE timing (stream entry point). Instruments the
    v2 PE; double-buffer reload, M-scaled penalty, lane-utilization stats. Validated by
    its own self-test (Fig.13 replay, roofline, double-buffer stalls, union
    under-utilization) and cross-checked on a real routed `fifo_b` from `functional.py`.
 
-3. **`perf_model.py`** — the per-pass engine. Drives the real functional
-   routing (`csr_to_positional → … → broadcast_to_fifo_b`, via `goSPA_run`) to obtain
-   the per-PE `fifo_b`, counts APU-Stage-1 / Stage-2 / memory (§4), calls `perf_pe`
-   per PE, and rolls up `pe_stage = max_k pe_cycles` + `FILL`/`DRAIN` into one pass's
-   cycle count. Validate against the small cases + the MobileNet case in
-   `functional.py`.
+3. **`perf_model.py`** — **DONE**: the per-pass engine. Drives the real front end via
+   the new pure `functional.goSPA_route` (shared with `goSPA_run`) to obtain each PE's
+   `fifo_b` + lane WSPs, counts APU-Stage-1 / Stage-2 / memory (§4), calls `perf_pe`
+   per PE, and returns `pass_cycles = max(stage1, stage2, max_k pe_cycles, mem)` with a
+   per-PE breakdown (bottleneck, load-imbalance factor, lane utilization). `FILL`/
+   `DRAIN` and the Cin / output-tile loops are deferred to `layer.py`. Validated by its
+   own self-test (front-end cross-check, roofline, load-imbalance, `STAGE1_ENUM` knob).
 
 4. **`layer.py`** — `Layer` descriptor (§5) plus the two outer loops `perf_model`
    doesn't own: the **output-channel pass loop** `ceil(Cout/(N_PE·M))`, and
