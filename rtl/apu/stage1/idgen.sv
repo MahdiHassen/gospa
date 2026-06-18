@@ -11,7 +11,7 @@ module idgen #(
     parameter  bit PIPE      = 1'b0,   // 0 = combinational outputs; 1 = register valid/cid/pid/a_xy one cycle
 
     localparam int E         = (H - F)/S + 1,                   
-    localparam int G         = int'($ceil(real'(F)/real'(S))),  // G=ceil(F/S)
+    localparam int G         = (F + S - 1)/S,                   // G=ceil(F/S)
     localparam int IDX_WIDTH = (H   < 2) ? 1 : $clog2(H),       // Coord width Px,Py,Cx,Cy 
     localparam int CID_WIDTH = (E*E < 2) ? 1 : $clog2(E*E),     // CID field width
     localparam int PID_WIDTH = (F*F < 2) ? 1 : $clog2(F*F),     // PID field width
