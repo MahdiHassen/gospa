@@ -1,6 +1,10 @@
 # Verilator build output
 obj_dir/
 
+# cocotb build outputs
+sim_build/
+results.xml
+
 # Simulation outputs
 *.vcd
 *.fst
@@ -11,3 +15,6 @@ obj_dir/
 .venv/
 __pycache__/
 *.pyc
+
+#VSCode
+.vscode/
