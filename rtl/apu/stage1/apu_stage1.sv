@@ -154,15 +154,15 @@ module apu_stage1 #(
     position_encode #(.H(H), .S(S), .DATA_W(DATA_W)) u_position_encode (
         .in_valid (zp_valid),
         .in_value (zp_value),
-        .in_x     (zp_x),
-        .in_y     (zp_y),
+        .x        (zp_x),
+        .y        (zp_y),
         .in_ready (zp_ready),
         .out_valid(pi_valid),
         .out_value(pi_value),
-        .out_Px   (pi_Px),
-        .out_Py   (pi_Py),
-        .out_Cx   (pi_Cx),
-        .out_Cy   (pi_Cy),
+        .Px       (pi_Px),
+        .Py       (pi_Py),
+        .Cx       (pi_Cx),
+        .Cy       (pi_Cy),
         .out_ready(pi_ready)
     );
 

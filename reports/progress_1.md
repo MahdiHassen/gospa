@@ -2,7 +2,6 @@
 
 **Team 19 — GoSPA: An Energy-efficient High-performance Globally Optimized Sparse CNN Accelerator** (ISCA 2021)
 
----
 
 ## 1. Per-member progress
 
@@ -24,9 +23,6 @@ first RTL vs SW co-simulation). The June 21 integration milestone is done early.
   form of the model's `csr_to_positional`.
 - **`rtl/apu/stage1/zero_act.sv`** -- combinational zero-activation filter (HW form of the model's
   `if val == 0: continue`), so zeros never reach the IDGen array.
-- **`rtl/apu/stage1/position_encode.sv`** *(new)* -- combinational stage computing `(Px,Py,Cx,Cy)`
-  from `(x,y)`. This is the missing upstream module that feeds the IDGen array. Verilator `-Wall`
-  clean.
 - **`rtl/apu/stage1/apu_stage1.sv`** *(new)* -- Stage-1 top that ties the chain together,
   `csr_decode -> zero_act -> position_encode -> idgen array (G x G) -> FIFO-A bank (F^2 slots)`. It
   adds an **all-or-nothing fan-out join** so the front end stalls until every targeted FIFO-A can
@@ -91,10 +87,27 @@ _To be completed by Sara._
 ---
 
 ### 1.5 Adil Kazimov
+**Status: Ahead of Schedule**
 
-_To be completed by Adil._
 
----
+**Completed:**
+
+- **`rtl/apu/stage1/idgen.sv`** -- CID/PID generator. Contains `idgen` + `idgen_unit` modules. The `idgen` bundle instantiates one `idgen_unit` per `(m,n)` in the GxG grid, each computing the bound checks and `CID=a·E+b`, `PID=c·F+d`.
+- **`testing/apu/idgen/tb_idgen.py`** -- cocotb testbench that sweeps every activation coordinate `(x,y)`, drives the bundle, and checks the emitted `(CID,PID)` set against a self-contained convolution reference computed in the testbench. It runs across swept layer configs and both `PIPE` timing modes via the Makefile; 2 tests passing under Verilator and Icarus.
+- **`rtl/apu/stage1/position_encode.sv`** -- combinational coordinate decomposition `Px=x%S`, `Py=y%S`, `Cx=x/S`, `Cy=y/S` that feeds `idgen`.
+- **`rtl/apu/stage2/routing.sv`** -- APU Stage 2 routing module. Drains the `N_PID` FIFO-A lanes in order, one head per cycle, and all-or-nothing multicasts each `{ACT,CID}` into every FIFO-B whose WSP (MSB-first by PID) selects that lane, with start/busy/done framing and backpressure handling.
+- **`testing/apu/routing/tb_routing.py`** -- cocotb testbench that cosimulates the RTL against the `sw/functional.py` golden model: per-PE FIFO-B contents are checked against `broadcast_to_fifo_b`. Extra tests are run to check timing properties that the model can't express (backpressure, no-idle-bubble, framing, empty lanes, MSB-first WSP orientation). 5 tests passing under Verilator and Icarus.
+- **`rtl/common/sram.sv`** -- parameterized synchronous SRAM used across the design.
+- **`testing/common/sram/tb_sram.py`** -- self-checking testbench against a Python reference memory. 5 tests passing (write/read-back, write-first, valid qualifiers, dual-port reads, reset) under Verilator and Icarus.
+
+**In progress:**
+
+- **`rtl/apu/pe/pe_acc.sv`** -- draft of the PE's accumulator block that compiles clean under Verilator and Icarus, with functional testbench to follow in the coming weeks.
+
+**Note**: `dram.sv` module has been discarded. See Section 3 for details.
+
+**Next**: Complete PE module following the team's schedule.
+
 
 ## 2. Weekly milestones — met / delayed / skipped
 
@@ -109,7 +122,7 @@ project start -> June 18.
 | Mahdi | Finish HW-design block diagram | **Met** | `GoSPA.drawio` / `.jpg` committed Jun 1 |
 | Sara | Break implementation into submodules for perf-model tests | | |
 | Emon | HW constraints, comms protocol w/ Adil, lab-PC setup, `fifo.sv` | **Met (early)** | FIFO + TB done Jun 1 |
-| Adil | Design memory `.sv` (sram, dram) | | |
+| Adil | Design memory `.sv` (sram, dram) |**Met** | DRAM module discarded |
 
 ### Sub-period ending June 14
 
@@ -119,7 +132,7 @@ project start -> June 18.
 | Mahdi | Work on functional model | **Met / exceeded** | Multi-PE + multi-channel + PyTorch validation done |
 | Sara | Model HW components at abstraction level | | |
 | Emon | `csr_decode.sv`, `zero_act.sv` | **Met** | Both done Jun 8 with cocotb tests |
-| Adil | `position_encode.sv`, `idgen.sv` | | |
+| Adil | `position_encode.sv`, `idgen.sv` | **Met**| |
 
 ### Sub-period ending June 21 (in progress at time of report)
 
@@ -129,9 +142,9 @@ project start -> June 18.
 | Mahdi | Finish functional model | **Effectively done** — validated end-to-end |
 | Sara | Work on perf model | |
 | Emon | Merge into `apu_stage1.sv` with IDGen + FIFOs | **Met (early)** — `apu_stage1.sv` integrated and verified vs the SW model (7 configs × 5 tests pass) |
-| Adil | `router.sv` | |
+| Adil | `router.sv` | **Met**|
 
----
+
 
 ## 3. Refinements to the initial plan
 
@@ -140,22 +153,13 @@ project start -> June 18.
    is checked end-to-end against `functional.py`. This becomes the standard acceptance check for
    each new RTL block as it lands.
 
-2. **HW sequencing worked; integration is complete early.** With `idgen.sv` landed, the
-   `apu_stage1.sv` integration was finished and verified ahead of the June 21 target. The next HW
-   priority is the Stage-2 routing module (`apu.sv`). The DRAM model stays lower priority, as the
-   memory hierarchy is simplified to fixed latency (per the plan) and modeled in the testbench.
+2. **HW sequencing worked; integration is complete early.** `apu_stage1.sv` integration was finished and verified ahead of the June 21 target. The next HW
+   priority are the Stage-2 and top-level apu modules. The DRAM model was discarded, as the
+   memory hierarchy is simplified to fixed latency and modeled in the testbench.
 
-3. **Build against interfaces, not implementations — paid off.** The Stage-1 top and FIFO-A bank
-   were written against the agreed IDGen port interface, so they integrated cleanly when IDGen
-   landed (and survived a mid-stream IDGen revision without rework).
-
-4. **Ensure commit visibility.** All members commit their own work to the repo, as individual
-   contribution is part of the project evaluation.
-
-5. **No change to downstream milestones.** APU Stage 2, PE, top-level, full-CNN, and metrics
+4. **No change to downstream milestones.** APU Stage 2, PE, top-level, full-CNN, and metrics
    milestones (July 12 -> Aug 9) remain as planned.
 
----
 
 ## 4. Repository pointers (evidence)
 
