@@ -135,7 +135,7 @@ project start -> June 18.
 
 ## 3. Refinements to the initial plan
 
-1. **RTL ↔ SW co-simulation pulled forward — and already started.** Rather than waiting for the
+1. **RTL <=> SW co-simulation pulled forward — and already started.** Rather than waiting for the
    July co-sim milestone, the functional model is now the golden reference for the RTL: `apu_stage1`
    is checked end-to-end against `functional.py`. This becomes the standard acceptance check for
    each new RTL block as it lands.
