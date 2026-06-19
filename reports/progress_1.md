@@ -82,8 +82,13 @@ on the HW side, starting in the July sub-periods.
 
 ### 1.4 Sara Ahmad
 
-_To be completed by Sara._
+**Completed:**
 
+- **`sw/layer.py`:** Layer description and multi-pass expansion over the output-channel tiling and input-channel accumulation. Sits above perf_model.py (which scores one pass; one activation map, one I/O channel each). 
+Applies fill/drain bracketing and once-per-layer output-store cost.
+Layer stats aggregrate lane utilization, load imbalance, bottleneck histogram stats.
+
+- **`sw/workloads/alexnet.py`:** AlexNet layer list as Layer objects (8 layers: conv1–conv5 + fc6–fc8) with verified output dimensions matching the paper's spatial sizes.
 ---
 
 ### 1.5 Adil Kazimov
@@ -120,7 +125,7 @@ project start -> June 18.
 |---|---|---|---|
 | Fred | Research perf-model requirements, determine abstraction level | **Met** | Concepts recorded in `PERF_MODEL_PLAN.md` |
 | Mahdi | Finish HW-design block diagram | **Met** | `GoSPA.drawio` / `.jpg` committed Jun 1 |
-| Sara | Break implementation into submodules for perf-model tests | | |
+| Sara | Break implementation into submodules for perf-model tests | **Met**  | Work with SW team to decide architecture |
 | Emon | HW constraints, comms protocol w/ Adil, lab-PC setup, `fifo.sv` | **Met (early)** | FIFO + TB done Jun 1 |
 | Adil | Design memory `.sv` (sram, dram) |**Met** | DRAM module discarded |
 
@@ -130,7 +135,7 @@ project start -> June 18.
 |---|---|---|---|
 | Fred | Perf-model skeleton + abstraction level | **Met** | Reusing logic for data routing from `functional.py`, account for latency & utilization |
 | Mahdi | Work on functional model | **Met / exceeded** | Multi-PE + multi-channel + PyTorch validation done |
-| Sara | Model HW components at abstraction level | | |
+| Sara | Model HW components at abstraction level | **Met/Rework** | Break perf-model into submodules to expand to a full conv layer |
 | Emon | `csr_decode.sv`, `zero_act.sv` | **Met** | Both done Jun 8 with cocotb tests |
 | Adil | `position_encode.sv`, `idgen.sv` | **Met**| |
 
@@ -140,7 +145,7 @@ project start -> June 18.
 |---|---|---|
 | Fred | Work on perf model | Working with other team members toward an end-to-end workload |
 | Mahdi | Finish functional model | **Effectively done** — validated end-to-end |
-| Sara | Work on perf model | |
+| Sara | Work on perf model | **Met** | Working with other team members toward an end-to-end workload
 | Emon | Merge into `apu_stage1.sv` with IDGen + FIFOs | **Met (early)** — `apu_stage1.sv` integrated and verified vs the SW model (7 configs × 5 tests pass) |
 | Adil | `router.sv` | **Met**|
 
