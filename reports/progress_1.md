@@ -52,7 +52,15 @@ Stage 2, which matches both the RTL and `functional.py`.
 
 ### 1.2 Fred Huang
 
-_To be completed by Fred._
+**Completed:**
+
+- **`sw/config.py`:** dataclass for integrated hardware configuration in performance model.
+- **`sw/PERF_MODEL_PLAN.md`:** detailed breakdown components and tasks for performance model. Guidance for collaboration with other team members on software simulation.
+- **`sw/perf_pe.py`:** performance accounting for a single PE. Designed to support 3 weight reloading models, ranging from `ideal` (no reloading penalty/reload completely hidden by computation) to `double_buffer` (overall reload penalty depends on previous PID's sparsity, visible only when compute takes shorter than reload). Also tracks multiplier utilization. Statistics reported as a dataclass `PEStats`.
+- Modified **`sw/functional.py`** to expose an API for APU processing (`goSPA_route`), reusing logic for data routing in performance model. 
+- **`sw/perf_model.py`:** performance accounting for a single pass on full GoSPA architecture, with `N_PE` PEs and `M` multipliers per PE. Records cycles for `stage1`, `stage2`, `pe` and `mem`, determines the system bottlenect as well as lane utilization, and reports with a dataclass `PassStats`.
+
+**Next:** work with other team members to bring up a full end-to-end workload on the software model. 
 
 ---
 
@@ -97,7 +105,7 @@ project start -> June 18.
 
 | Member | Planned task | Status | Notes |
 |---|---|---|---|
-| Fred | Research perf-model requirements, determine abstraction level | | |
+| Fred | Research perf-model requirements, determine abstraction level | **Met** | Concepts recorded in `PERF_MODEL_PLAN.md` |
 | Mahdi | Finish HW-design block diagram | **Met** | `GoSPA.drawio` / `.jpg` committed Jun 1 |
 | Sara | Break implementation into submodules for perf-model tests | | |
 | Emon | HW constraints, comms protocol w/ Adil, lab-PC setup, `fifo.sv` | **Met (early)** | FIFO + TB done Jun 1 |
@@ -107,7 +115,7 @@ project start -> June 18.
 
 | Member | Planned task | Status | Notes |
 |---|---|---|---|
-| Fred | Perf-model skeleton + abstraction level | | |
+| Fred | Perf-model skeleton + abstraction level | **Met** | Reusing logic for data routing from `functional.py`, account for latency & utilization |
 | Mahdi | Work on functional model | **Met / exceeded** | Multi-PE + multi-channel + PyTorch validation done |
 | Sara | Model HW components at abstraction level | | |
 | Emon | `csr_decode.sv`, `zero_act.sv` | **Met** | Both done Jun 8 with cocotb tests |
@@ -117,7 +125,7 @@ project start -> June 18.
 
 | Member | Planned task | Status @ Jun 18 |
 |---|---|---|
-| Fred | Work on perf model | |
+| Fred | Work on perf model | Working with other team members toward an end-to-end workload |
 | Mahdi | Finish functional model | **Effectively done** — validated end-to-end |
 | Sara | Work on perf model | |
 | Emon | Merge into `apu_stage1.sv` with IDGen + FIFOs | **Met (early)** — `apu_stage1.sv` integrated and verified vs the SW model (7 configs × 5 tests pass) |
