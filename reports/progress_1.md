@@ -89,6 +89,8 @@ Applies fill/drain bracketing and once-per-layer output-store cost.
 Layer stats aggregrate lane utilization, load imbalance, bottleneck histogram stats.
 
 - **`sw/workloads/alexnet.py`:** AlexNet layer list as Layer objects (8 layers: conv1–conv5 + fc6–fc8) with verified output dimensions matching the paper's spatial sizes.
+- **`sw/sim.py`:** full neural network running alexnet. Runs simulate_layer and  reports per-layer and total latency (ms), FPS, lane utilization, load-imbalance factor, and dominant bottleneck stage. Computes speedup vs. a dense baseline (d_a=d_w=1.0) for comparison. 
+To run: run_network and print_report are importable; python sim.py runs AlexNet end-to-end with synthetic sparsity
 ---
 
 ### 1.5 Adil Kazimov
