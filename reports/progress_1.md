@@ -164,13 +164,3 @@ project start -> June 18.
 
 4. **No change to downstream milestones.** APU Stage 2, PE, top-level, full-CNN, and metrics
    milestones (July 12 -> Aug 9) remain as planned.
-
-
-## 4. Repository pointers (evidence)
-
-- SW functional model: `sw/functional.py`, refs in `testing/ref/`
-- SW performance model: `sw/perf_model.py`, `sw/perf_pe.py`, `sw/config.py`, `sw/PERF_MODEL_PLAN.md`
-- APU Stage-1 RTL: `rtl/apu/stage1/{csr_decode,zero_act,position_encode,apu_stage1}.sv`
-- Shared RTL: `rtl/common/fifo.sv`, `rtl/common/sram.sv`
-- Tests: `testing/common/` (FIFO, 92 checks), `testing/apu/stage1/` (cocotb: `test_csr_decode`,
-  `test_zero_act`, `test_apu_stage1` — full-stage co-sim vs `functional.py`, 7 configs × 5 tests pass)
