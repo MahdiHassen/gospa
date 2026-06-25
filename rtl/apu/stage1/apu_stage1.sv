@@ -60,7 +60,8 @@ module apu_stage1 #(
     localparam int IDX_W    = (H   < 2) ? 1 : $clog2(H),      // coord width
     localparam int CID_W    = (E*E < 2) ? 1 : $clog2(E*E),    // CID width
     localparam int PID_W    = (F*F < 2) ? 1 : $clog2(F*F),    // PID width
-    localparam int FIFOA_W  = DATA_W + CID_W                  // FIFO-A payload width
+    localparam int FIFOA_W  = DATA_W + CID_W,                 // FIFO-A payload width
+    localparam int CNT_W    = $clog2(FIFO_D) + 1              // FIFO occupancy width
 )(
     input  wire  logic                              clk,
     input  wire  logic                              rst_n,
@@ -78,7 +79,9 @@ module apu_stage1 #(
     // -- FIFO-A read ports (one per PID slot; consumed by Stage 2) -------------
     output logic [N_PID-1:0]                        fifoa_rd_valid,
     output logic [N_PID-1:0][FIFOA_W-1:0]           fifoa_rd_data,   // {a_xy, cid}
-    input  wire  logic [N_PID-1:0]                  fifoa_rd_ready
+    input  wire  logic [N_PID-1:0]                  fifoa_rd_ready,
+    // Per-slot occupancy so Stage 2 can derive almost_empty (count == 1).
+    output logic [N_PID-1:0][CNT_W-1:0]             fifoa_count
 );
 
     // -------------------------------------------------------------------------
@@ -240,7 +243,7 @@ module apu_stage1 #(
                 .rd_ready(fifoa_rd_ready[p]),
                 .full    (),
                 .empty   (),
-                .count   ()
+                .count   (fifoa_count[p])
             );
         end
     endgenerate

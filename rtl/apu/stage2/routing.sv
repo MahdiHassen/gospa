@@ -86,7 +86,8 @@ module routing #(
     end
 
     // Sequencer: walk lanes 0..N_PID-1; hold while backpressured.
-    always_ff @(posedge clk or negedge rst_n) begin
+    // Synchronous reset to match the rest of the design's reset domain.
+    always_ff @(posedge clk) begin
         if (!rst_n) begin
             state <= S_IDLE;
             cur   <= '0;
