@@ -94,35 +94,54 @@ def route_array(act, kernels):
 # DUT driver
 # ---------------------------------------------------------------------------
 async def reset(dut):
-    dut.rst_n.value       = 0
-    dut.wload_en.value    = 0
-    dut.wload_pe.value    = 0
-    dut.wload_pid.value   = 0
-    dut.wload_val.value   = 0
-    dut.wload_done.value  = 0
-    dut.fifob_valid.value = 0
-    dut.fifob_data.value  = 0
-    dut.drain_start.value = 0
-    dut.out_ready.value   = 0
+    dut.rst_n.value         = 0
+    dut.wfill_we.value      = 0
+    dut.wfill_pe.value      = 0
+    dut.wfill_addr.value    = 0
+    dut.wfill_pid.value     = 0
+    dut.wfill_val.value     = 0
+    dut.wload_count.value   = 0
+    dut.wload_done.value    = 0
+    dut.fifob_valid.value   = 0
+    dut.fifob_data.value    = 0
+    dut.drain_start.value   = 0
+    dut.out_ready.value     = 0
     for _ in range(4):
         await RisingEdge(dut.clk)
     dut.rst_n.value = 1
     await RisingEdge(dut.clk)
 
 
+def _pack_count_bus(counts, width):
+    """Pack list[N_PE] of per-PE counts into one big {width*N_PE} bus."""
+    val = 0
+    for k in range(len(counts)):
+        val |= (counts[k] & ((1 << width) - 1)) << (k * width)
+    return val
+
+
 async def load_weights(dut, sw_list):
+    """Write each PE's weights into its on-chip SRAM (one slot/cycle), then
+    drive per-PE counts and pulse wload_done to arm all PEs together."""
+    WPTR_W = max(1, (N_PID + 1 - 1).bit_length())   # mirror RTL $clog2(N_PID+1)
     for k in range(N_PE):
-        for (pid, val) in sw_list[k]:
-            dut.wload_en.value  = 1
-            dut.wload_pe.value  = k
-            dut.wload_pid.value = pid
-            dut.wload_val.value = _mask(val, DATA_W)
+        for slot, (pid, val) in enumerate(sw_list[k]):
+            dut.wfill_we.value   = 1
+            dut.wfill_pe.value   = k
+            dut.wfill_addr.value = slot
+            dut.wfill_pid.value  = pid
+            dut.wfill_val.value  = _mask(val, DATA_W)
             await RisingEdge(dut.clk)
-    dut.wload_en.value = 0
-    await RisingEdge(dut.clk)              # gap before arming
-    dut.wload_done.value = 1
+    dut.wfill_we.value = 0
+    await RisingEdge(dut.clk)
+    dut.wload_count.value = _pack_count_bus(
+        [len(sw) for sw in sw_list], WPTR_W)
+    dut.wload_done.value  = 1
     await RisingEdge(dut.clk)
     dut.wload_done.value = 0
+    # Two-cycle warm-up: SRAM serves Curr from slot 0, Next from slot 1.
+    for _ in range(2):
+        await RisingEdge(dut.clk)
 
 
 async def stream_fifob(dut, fifo_b_list, timeout=200000):

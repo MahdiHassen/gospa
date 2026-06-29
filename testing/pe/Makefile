@@ -11,17 +11,18 @@
 #   make clean
 # ==============================================================================
 
-SIM      ?= icarus
+SIM      ?= verilator
 TOPLEVEL_LANG ?= verilog
 
 REPO_ROOT := $(realpath ../..)
 PE_DIR    := $(REPO_ROOT)/rtl/pe
 
 # -- Layer config (override on command line) ----------------------------------
-H    ?= 8
-F    ?= 3
-S    ?= 1
-N_PE ?= 4
+H       ?= 8
+F       ?= 3
+S       ?= 1
+N_PE    ?= 4
+N_MULTS ?= 1
 
 # Derived sizes the PE is parameterized by (kernel positions, output positions).
 N_PID := $(shell echo $$(( $(F) * $(F) )))
@@ -32,15 +33,19 @@ MODULE ?= test_pe
 
 # Single PE vs PE array: pick top module + sources from MODULE.
 ifeq ($(MODULE),test_pe_array)
-    VERILOG_SOURCES := $(PE_DIR)/pe_acc.sv $(PE_DIR)/pe.sv $(PE_DIR)/pe_array.sv
+    VERILOG_SOURCES := $(REPO_ROOT)/rtl/common/sram.sv \
+                       $(PE_DIR)/pe_acc.sv $(PE_DIR)/pe.sv $(PE_DIR)/pe_array.sv
     TOPLEVEL        := pe_array
-    PARAMS_ICARUS   := -Ppe_array.N_PID=$(N_PID) -Ppe_array.N_CID=$(N_CID) -Ppe_array.N_PE=$(N_PE)
-    PARAMS_VERILATOR:= -GN_PID=$(N_PID) -GN_CID=$(N_CID) -GN_PE=$(N_PE)
+    PARAMS_ICARUS   := -Ppe_array.N_PID=$(N_PID) -Ppe_array.N_CID=$(N_CID) \
+                       -Ppe_array.N_PE=$(N_PE) -Ppe_array.N_MULTS=$(N_MULTS)
+    PARAMS_VERILATOR:= -GN_PID=$(N_PID) -GN_CID=$(N_CID) \
+                       -GN_PE=$(N_PE) -GN_MULTS=$(N_MULTS)
 else
-    VERILOG_SOURCES := $(PE_DIR)/pe_acc.sv $(PE_DIR)/pe.sv
+    VERILOG_SOURCES := $(REPO_ROOT)/rtl/common/sram.sv \
+                       $(PE_DIR)/pe_acc.sv $(PE_DIR)/pe.sv
     TOPLEVEL        := pe
-    PARAMS_ICARUS   := -Ppe.N_PID=$(N_PID) -Ppe.N_CID=$(N_CID)
-    PARAMS_VERILATOR:= -GN_PID=$(N_PID) -GN_CID=$(N_CID)
+    PARAMS_ICARUS   := -Ppe.N_PID=$(N_PID) -Ppe.N_CID=$(N_CID) -Ppe.N_MULTS=$(N_MULTS)
+    PARAMS_VERILATOR:= -GN_PID=$(N_PID) -GN_CID=$(N_CID) -GN_MULTS=$(N_MULTS)
 endif
 
 ifeq ($(SIM),icarus)
@@ -48,7 +53,8 @@ ifeq ($(SIM),icarus)
 endif
 ifeq ($(SIM),verilator)
     COMPILE_ARGS += $(PARAMS_VERILATOR)
-    EXTRA_ARGS   += --timing -Wall --Wno-UNOPTFLAT --Wno-WIDTH --Wno-TIMESCALEMOD --Wno-DECLFILENAME
+    EXTRA_ARGS   += --timing -Wall --Wno-UNOPTFLAT --Wno-WIDTH --Wno-TIMESCALEMOD \
+                    --Wno-DECLFILENAME --Wno-UNUSEDSIGNAL --Wno-EOFNEWLINE
 endif
 
 # make config visible to the testbench
@@ -56,6 +62,7 @@ export H
 export F
 export S
 export N_PE
+export N_MULTS
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
