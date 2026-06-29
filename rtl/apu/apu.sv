@@ -49,7 +49,8 @@ module apu #(
     localparam int PTR_W     = (N_NZ_MAX + 1 < 2) ? 1 : $clog2(N_NZ_MAX + 1),
     localparam int ENT_AW    = (N_NZ_MAX < 2)     ? 1 : $clog2(N_NZ_MAX),
     localparam int RPTR_AW   = (N_ROWS + 1 < 2)   ? 1 : $clog2(N_ROWS + 1),
-    localparam int N_CNT_W   = (N_ROWS + 1 < 2)   ? 1 : $clog2(N_ROWS + 1)
+    localparam int N_CNT_W   = (N_ROWS + 1 < 2)   ? 1 : $clog2(N_ROWS + 1),
+    localparam int PE_IDX_W  = (N_PE  < 2)        ? 1 : $clog2(N_PE)
 )(
     input  wire  logic                              clk,
     input  wire  logic                              rst_n,
@@ -77,8 +78,11 @@ module apu #(
     output logic                                    s2_busy,
     output logic                                    s2_done,
 
-    // -- WSP register file (one per PE, MSB-first by PID) --------------------
-    input  wire  logic [N_PE-1:0][N_PID-1:0]        wsp,
+    // -- WSP register file write port (one PE's full WSP per cycle) ----------
+    //    MSB-first by PID -- wsp_wdata[N_PID-1] = bit for PID 0, etc.
+    input  wire  logic                              wsp_we,
+    input  wire  logic [PE_IDX_W-1:0]               wsp_waddr,
+    input  wire  logic [N_PID-1:0]                  wsp_wdata,
 
     // -- FIFO-B read ports (consumed by the PE array) ------------------------
     output logic [N_PE-1:0]                         fifob_rd_valid,
@@ -142,6 +146,22 @@ module apu #(
         .fifoa_count   (fa_count)
     );
 
+    // -------------------------------------------------------------------------
+    // WSP register file: small flop-based store, one full WSP per PE.
+    // Host pre-computes the V2 union of per-lane WSPs in software and writes
+    // it here; routing.sv reads all N_PE values in parallel each cycle.
+    // -------------------------------------------------------------------------
+    logic [N_PE-1:0][N_PID-1:0] wsp_q;
+
+    wsp_file #(.N_PE(N_PE), .N_PID(N_PID)) u_wsp_file (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .wsp_we   (wsp_we),
+        .wsp_waddr(wsp_waddr),
+        .wsp_wdata(wsp_wdata),
+        .wsp      (wsp_q)
+    );
+
     apu_stage2 #(
         .H(H), .F(F), .S(S),
         .N_PE(N_PE), .DATA_W(DATA_W), .FIFO_D(FIFO_D)
@@ -151,7 +171,7 @@ module apu #(
         .start         (s2_start),
         .busy          (s2_busy),
         .done          (s2_done),
-        .wsp           (wsp),
+        .wsp           (wsp_q),
         .fifoa_rd_valid(fa_rd_valid),
         .fifoa_rd_data (fa_rd_data),
         .fifoa_rd_ready(fa_rd_ready),
@@ -160,6 +180,14 @@ module apu #(
         .fifob_rd_data (fifob_rd_data),
         .fifob_rd_ready(fifob_rd_ready)
     );
+
+    // -- Optional VCD waveform dump (enable with `+define+DUMP_VCD`) ---------
+`ifdef DUMP_VCD
+    initial begin
+        $dumpfile("dump.vcd");
+        $dumpvars(0, apu);
+    end
+`endif
 
 endmodule
 

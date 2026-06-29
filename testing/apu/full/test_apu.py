@@ -109,13 +109,12 @@ def _rand_wsps(rng):
     return [[rng.randint(0, 1) for _ in range(N_PID)] for _ in range(N_PE)]
 
 
-def _pack_wsp(wsps):
-    """list[N_PE][N_PID] -> packed bus, MSB-first by PID (matches RTL)."""
+def _pack_one_wsp(wsp_per_pe):
+    """Pack one PE's WSP (list[N_PID], index = PID) MSB-first to match RTL."""
     val = 0
-    for k in range(N_PE):
-        for p in range(N_PID):
-            if wsps[k][p]:
-                val |= 1 << (k * N_PID + (N_PID - 1 - p))
+    for p in range(N_PID):
+        if wsp_per_pe[p]:
+            val |= 1 << (N_PID - 1 - p)
     return val
 
 
@@ -135,11 +134,26 @@ async def reset(dut):
     dut.scan_n_rows.value       = 0
     dut.scan_base_row.value     = 0
     dut.s2_start.value          = 0
-    dut.wsp.value               = 0
+    dut.wsp_we.value            = 0
+    dut.wsp_waddr.value         = 0
+    dut.wsp_wdata.value         = 0
     dut.fifob_rd_ready.value    = 0
     for _ in range(4):
         await RisingEdge(dut.clk)
     dut.rst_n.value = 1
+    await RisingEdge(dut.clk)
+
+
+async def load_wsps(dut, wsps):
+    """Write each PE's WSP into the on-chip wsp_file (one per cycle)."""
+    dut.wsp_we.value = 1
+    for k in range(N_PE):
+        dut.wsp_waddr.value = k
+        dut.wsp_wdata.value = _pack_one_wsp(wsps[k])
+        await RisingEdge(dut.clk)
+    dut.wsp_we.value    = 0
+    dut.wsp_waddr.value = 0
+    dut.wsp_wdata.value = 0
     await RisingEdge(dut.clk)
 
 
@@ -279,7 +293,7 @@ def check_against_golden(dut, got, matrix, wsps, name):
 
 async def run_case(dut, matrix, wsps, name):
     await reset(dut)
-    dut.wsp.value = _pack_wsp(wsps)
+    await load_wsps(dut, wsps)
     await feed_matrix(dut, matrix)
     got = await run_stage2_and_drain(dut)
     check_against_golden(dut, got, matrix, wsps, name)

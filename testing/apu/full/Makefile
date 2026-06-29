@@ -30,6 +30,7 @@ VERILOG_SOURCES := $(RTL_DIR)/common/fifo.sv \
                    $(RTL_DIR)/apu/stage2/routing.sv \
                    $(RTL_DIR)/apu/stage2/apu_stage2.sv \
                    $(RTL_DIR)/apu/act_sram_scanner.sv \
+                   $(RTL_DIR)/apu/wsp_file.sv \
                    $(RTL_DIR)/apu/apu.sv
 
 # -- Functional-model import: the TB does `import functional` from sw/ -------
@@ -47,12 +48,29 @@ ifeq ($(SIM),icarus)
                     -Papu.H=$(H) -Papu.F=$(F) -Papu.S=$(S) \
                     -Papu.N_PE=$(N_PE) -Papu.N_ROWS=$(N_ROWS)
 endif
+FIFO_D ?= 64
+
 ifeq ($(SIM),verilator)
-    COMPILE_ARGS += -GH=$(H) -GF=$(F) -GS=$(S) -GN_PE=$(N_PE) -GN_ROWS=$(N_ROWS)
+    COMPILE_ARGS += -GH=$(H) -GF=$(F) -GS=$(S) -GN_PE=$(N_PE) -GN_ROWS=$(N_ROWS) \
+                    -GN_NZ_MAX=$(or $(N_NZ_MAX),1024) -GFIFO_D=$(FIFO_D)
     EXTRA_ARGS   += --timing -Wall \
                     --Wno-UNOPTFLAT --Wno-WIDTH --Wno-TIMESCALEMOD \
                     --Wno-DECLFILENAME --Wno-UNUSEDSIGNAL --Wno-EOFNEWLINE \
                     --assert
+endif
+ifeq ($(SIM),icarus)
+    COMPILE_ARGS += -Papu.N_NZ_MAX=$(or $(N_NZ_MAX),1024) -Papu.FIFO_D=$(FIFO_D)
+endif
+
+export FIFO_D
+
+# Optional: dump a VCD trace. Enable with `WAVES=1 make ...`. Output lands in
+# sim_build/dump.vcd; open with GTKWave or Surfer.
+ifeq ($(WAVES),1)
+    COMPILE_ARGS += +define+DUMP_VCD
+    ifeq ($(SIM),verilator)
+        EXTRA_ARGS += --trace --trace-structs
+    endif
 endif
 
 export H
@@ -62,6 +80,13 @@ export N_PE
 export N_ROWS
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
+
+# -- MobileNet first-conv co-sim -- 32 red-channel kernels, V2 mapping --------
+.PHONY: mobilenet
+mobilenet:
+	$(MAKE) -s clean
+	$(MAKE) -s MODULE=test_apu_mobilenet SIM=$(SIM) \
+		H=34 F=3 S=2 N_PE=8 N_ROWS=34 N_NZ_MAX=2048 FIFO_D=2048
 
 # -- Sweep across representative layer configs --------------------------------
 .PHONY: sweep_apu clean_all help
