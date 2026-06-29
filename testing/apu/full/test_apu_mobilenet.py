@@ -35,6 +35,7 @@ import random
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, ReadOnly
+from cocotb.utils import get_sim_time
 
 # ---------------------------------------------------------------------------
 # Reach the sw/ model and the testing/ref/ MobileNet loader.
@@ -345,3 +346,118 @@ async def test_mobilenet_red_channel(dut):
         f"PASS -- per-PE FIFO-B counts {totals}, total {sum(totals)} entries, "
         f"all match functional v2 golden"
     )
+
+
+# ---------------------------------------------------------------------------
+# Performance metrics
+# ---------------------------------------------------------------------------
+def _cyc(t_start_ns, t_end_ns):
+    return int(round((t_end_ns - t_start_ns) / CLK_NS))
+
+
+@cocotb.test()
+async def test_mobilenet_perf(dut):
+    """Run the same MobileNet workload but instrument each phase and print
+    a cycle-count summary. Useful for tracking RTL throughput as the design
+    evolves and for cross-checking against sw/perf_model.py."""
+    cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
+    rng = random.Random(0xBEEF)
+
+    await reset(dut)
+
+    # --- Phase 1: WSP load -------------------------------------------------
+    t0 = get_sim_time(unit="ns")
+    await load_wsps(dut, UNION_WSPS)
+    t_wsp = get_sim_time(unit="ns")
+
+    # --- Phase 2: SRAM fill (row_ptr flops + entry SRAM, CSR-encoded) ------
+    matrix = make_padded_activation(rng, sparsity=0.5)
+    n_nz = sum(1 for row in matrix for v in row if v != 0)
+
+    t_fill_a = get_sim_time(unit="ns")
+    await fill_sram_csr(dut, matrix)
+    t_fill_b = get_sim_time(unit="ns")
+
+    # --- Phase 3: Scan + Stage 1 (CSR -> FIFO-A) ---------------------------
+    t_scan_a = get_sim_time(unit="ns")
+    await trigger_scan(dut, n_rows=H, base_row=0)
+    t_scan_b = get_sim_time(unit="ns")
+
+    # --- Phase 4: Stage 2 drain (FIFO-A -> FIFO-B via routing) -------------
+    t_s2_a = get_sim_time(unit="ns")
+    got = await run_stage2_and_drain(dut)
+    t_s2_b = get_sim_time(unit="ns")
+
+    # ---------------------------- Reporting --------------------------------
+    # Workload stats from the functional model golden (free reference data).
+    r = fm.goSPA_route(matrix, KERNELS, S,
+                       num_pes=N_PE, num_mults=N_MULTS, interpretation="v2")
+    n_pairs = r.n_pairs                       # NZ after Stage 1 (CID,PID) expansion
+    per_pid = [0] * N_PID
+    # Re-derive per-PID FIFO-A occupancy for theoretical Stage 2 bound.
+    for fb in r.fifo_b_list:
+        # Each fb entry is (a, c, p). Stage 2 drains FIFO-A per PID; FIFO-A
+        # holds the (a, c) tuples for each PID, then routing fans out.
+        # The per-PID FIFO-A count equals (entries in fb at that PID) /
+        # (number of selected PEs for that PID), but here we just want a
+        # theoretical lower bound for the drain phase, which is the max
+        # over PIDs of (FIFO-A[p] entries).
+        pass
+    # Easier: re-route through Stage 1 only and use route_to_fifo_a output.
+    values, col_idx, row_ptr = fm.dense_to_csr(matrix)
+    stream = fm.csr_to_positional(values, col_idx, row_ptr)
+    stream = fm.zero_act_filter(stream)
+    pairs = []
+    for (axy, x, y) in stream:
+        a, px, py, cx, cy = fm.axy_to_pcid(axy, x, y, S)
+        pairs.extend(fm.pcid_to_cid_pid(a, px, py, cx, cy, F, H, S))
+    fifo_a_lens = [len(slot) for slot in fm.route_to_fifo_a(pairs, F)]
+    s2_lower_bound = sum(fifo_a_lens)         # routing pops each FIFO-A entry once
+
+    # Dense baseline: scan walks H*H entries unconditionally; Stage 2 drains
+    # H*H * G^2 (every cell hits up to G^2 output positions). This is the
+    # naive cost without sparsity exploitation.
+    G = (F + S - 1) // S
+    dense_scan_baseline = H * H
+    dense_s2_baseline   = H * H * G * G       # rough; ignores edge masking
+
+    fill_cyc = _cyc(t_fill_a, t_fill_b)
+    wsp_cyc  = _cyc(t0,        t_wsp)
+    scan_cyc = _cyc(t_scan_a,  t_scan_b)
+    s2_cyc   = _cyc(t_s2_a,    t_s2_b)
+    total    = _cyc(t0,        t_s2_b)
+    total_fb = sum(len(s) for s in got)
+
+    log = dut._log.info
+    log("============================================================")
+    log("  RTL APU performance -- MobileNetV2 first conv, red channel")
+    log("============================================================")
+    log(f"  Layer cfg : H={H} F={F} S={S}  -> E={E}  N_PID={N_PID}  G={G}")
+    log(f"  Mapping   : {N_PE} PEs x {N_MULTS} kernels/PE = {N_KERNELS} channels (V2)")
+    log(f"  Activation: {H}x{H} ({n_nz} non-zeros, {n_nz/(H*H):.1%} density)")
+    log(f"  After S1  : {n_pairs} (CID,PID) pairs in FIFO-A "
+        f"({n_pairs/n_nz:.2f}x expansion)")
+    log(f"  After S2  : {total_fb} entries across {N_PE} FIFO-Bs "
+        f"(~{total_fb/N_PE:.0f}/PE)")
+    log("")
+    log(f"  Phase                                  Cycles    Notes")
+    log(f"  -------------------------------------- ------    -------------------------")
+    log(f"  WSP load           ({N_PE} PE writes)  {wsp_cyc:>6d}    ~1 cyc/PE write")
+    log(f"  SRAM fill (CSR)    ({n_nz} NZ + {N_ROWS+1} ptrs)  "
+        f"{fill_cyc:>6d}    ~1 cyc/word")
+    log(f"  Scan / Stage 1      (scan_start -> done) {scan_cyc:>6d}    "
+        f"{n_nz/scan_cyc:.2f} NZ/cyc, {n_pairs/scan_cyc:.2f} pairs/cyc")
+    log(f"  Stage 2 drain       (s2_start  -> done)  {s2_cyc:>6d}    "
+        f"{total_fb/s2_cyc:.2f} FIFO-B push/cyc")
+    log(f"  --------------------------------------------------------")
+    log(f"  TOTAL (host writes -> last PE pop)      {total:>6d}")
+    log("")
+    log(f"  Latency  (first scan -> last drain)   = {_cyc(t_scan_a, t_s2_b)} cyc")
+    log(f"  Compute throughput (sparse / dense baseline):")
+    log(f"     Scan stage : {scan_cyc} vs dense {dense_scan_baseline} "
+        f"-> {dense_scan_baseline/scan_cyc:.2f}x speedup")
+    log(f"     S2   stage : {s2_cyc} vs dense {dense_s2_baseline}   "
+        f"-> {dense_s2_baseline/s2_cyc:.2f}x speedup")
+    log(f"  Stage 2 efficiency vs FIFO-A drain LB = {s2_lower_bound}/{s2_cyc} "
+        f"= {s2_lower_bound/s2_cyc:.2f}x (1.0 = perfect)")
+    log("============================================================")
