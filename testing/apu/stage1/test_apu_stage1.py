@@ -100,11 +100,10 @@ def _rand_matrix(rng, density):
 # ---------------------------------------------------------------------------
 async def reset(dut):
     dut.rst_n.value          = 0
-    dut.row_ptr_valid.value  = 0
-    dut.row_ptr_data.value   = 0
-    dut.entry_valid.value    = 0
-    dut.entry_value.value    = 0
-    dut.entry_col.value      = 0
+    dut.in_valid.value       = 0
+    dut.in_value.value       = 0
+    dut.in_x.value           = 0
+    dut.in_y.value           = 0
     dut.fifoa_rd_ready.value = 0
     for _ in range(4):
         await RisingEdge(dut.clk)
@@ -112,44 +111,33 @@ async def reset(dut):
     await RisingEdge(dut.clk)
 
 
-async def _send_row_ptr(dut, ptr):
-    dut.row_ptr_valid.value = 1
-    dut.row_ptr_data.value  = ptr
+async def _send_tuple(dut, value, x, y):
+    """Present one (val, x, y) tuple to apu_stage1 and wait for in_ready."""
+    dut.in_valid.value = 1
+    dut.in_value.value = value & ((1 << DATA_W) - 1)
+    dut.in_x.value     = x
+    dut.in_y.value     = y
     while True:
         await RisingEdge(dut.clk)
-        if dut.row_ptr_ready.value == 1:
+        if dut.in_ready.value == 1:
             break
-    dut.row_ptr_valid.value = 0
-
-
-async def _send_entry(dut, value, col):
-    dut.entry_valid.value = 1
-    dut.entry_value.value = value & ((1 << DATA_W) - 1)
-    dut.entry_col.value   = col
-    while True:
-        await RisingEdge(dut.clk)
-        if dut.entry_ready.value == 1:
-            break
-    dut.entry_valid.value = 0
+    dut.in_valid.value = 0
 
 
 async def feed_matrix(dut, matrix):
-    """Stream a dense matrix in as CSR (row_ptr + entry streams, concurrently)."""
-    values, col_idx, row_ptr = fm.dense_to_csr(matrix)
+    """Stream the dense matrix as (val, x=row, y=col) tuples (one per cycle).
 
-    async def drive_rptr():
-        for ptr in row_ptr:
-            await _send_row_ptr(dut, ptr)
-
-    async def drive_entries():
-        for v, c in zip(values, col_idx):
-            await _send_entry(dut, v, c)
-
-    rt = cocotb.start_soon(drive_rptr())
-    et = cocotb.start_soon(drive_entries())
-    await rt
-    await et
-    # let the last accepted entry propagate into FIFO-A
+    apu_stage1 no longer holds csr_decode -- the front end (act_sram_scanner
+    in apu.sv, or this TB) is responsible for emitting (val, x, y).
+    """
+    for r in range(H):
+        for c in range(H):
+            v = matrix[r][c]
+            if v == 0:
+                # zero_act would suppress these anyway; skipping shortens the TB
+                continue
+            await _send_tuple(dut, v, r, c)
+    # let the last accepted tuple propagate into FIFO-A
     for _ in range(5):
         await RisingEdge(dut.clk)
 

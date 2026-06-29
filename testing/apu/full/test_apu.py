@@ -1,23 +1,26 @@
 """
-test_apu.py -- cocotb tests for apu.sv (full APU = Stage 1 + Stage 2)
+test_apu.py -- cocotb tests for apu.sv (full APU = Activation SRAM + Stage 1 + Stage 2)
 GoSPA Project -- Team 19, ECE 720 (Spring 2026)
 
-End-to-end APU RTL <-> SW cosim.
+End-to-end APU RTL <-> SW cosim with the new pipelined front-end.
 
-Drives a dense H x H activation matrix as CSR into apu.sv, sets per-PE WSPs,
-pulses s2_start, drains the FIFO-B bank concurrently, and checks each PE's
-collected (a_xy, pid, cid) stream against the team functional model:
+For each test the TB:
+  1. Writes a dense H x H activation matrix into the on-chip activation
+     SRAM via the fill port (one entry/cycle, addr = row*H + col).
+  2. Pulses scan_start with n_rows=H, base_y=0 to walk the SRAM. The
+     scanner emits (val, x, y) one per cycle into apu_stage1.
+  3. After scan_done, pulses s2_start; routing drains FIFO-A and
+     multicasts WSP-gated entries into the per-PE FIFO-B bank.
+  4. Drains FIFO-B concurrently with Stage 2 and checks each PE's stream
+     against the functional model:
 
-    csr_to_positional -> zero_act_filter -> axy_to_pcid
-                      -> pcid_to_cid_pid  -> route_to_fifo_a
-                      -> broadcast_to_fifo_b
-
-The TB depends on the same valid/ready handshakes and FIFO backpressure
-semantics that are unit-tested in test_apu_stage1.py and tb_routing.py.
+         csr_to_positional -> zero_act_filter -> axy_to_pcid
+                           -> pcid_to_cid_pid  -> route_to_fifo_a
+                           -> broadcast_to_fifo_b
 
 Run:
-    make MODULE=test_apu SIM=icarus                       # default H=8 F=3 S=1 N_PE=4
-    make MODULE=test_apu SIM=icarus H=8 F=3 S=2 N_PE=8
+    make MODULE=test_apu                                  # default H=8 F=3 S=1 N_PE=4
+    make MODULE=test_apu H=8 F=3 S=2 N_PE=8
     make sweep_apu                                        # many configs
 """
 
@@ -35,22 +38,28 @@ import functional as fm                                  # noqa: E402
 fm._VERBOSE = False
 
 # -- Config (must match Makefile -P/-G overrides) ---------------------------
-H      = int(os.environ.get("H", "8"))
-F      = int(os.environ.get("F", "3"))
-S      = int(os.environ.get("S", "1"))
-N_PE   = int(os.environ.get("N_PE", "4"))
-DATA_W = 16
+H        = int(os.environ.get("H", "8"))
+F        = int(os.environ.get("F", "3"))
+S        = int(os.environ.get("S", "1"))
+N_PE     = int(os.environ.get("N_PE", "4"))
+N_ROWS   = int(os.environ.get("N_ROWS",   str(H)))     # rows the scanner walks
+N_NZ_MAX = int(os.environ.get("N_NZ_MAX", str(H * H))) # entry SRAM depth
+DATA_W   = 16
 
 
 def _rtl_clog2(n):
     return 0 if n <= 1 else (n - 1).bit_length()
 
 
-E       = (H - F) // S + 1
-N_PID   = F * F
-CID_W   = 1 if (E * E) < 2 else _rtl_clog2(E * E)
-PID_W   = 1 if N_PID    < 2 else _rtl_clog2(N_PID)
-FIFOB_W = DATA_W + PID_W + CID_W
+E         = (H - F) // S + 1
+N_PID     = F * F
+CID_W     = 1 if (E * E) < 2 else _rtl_clog2(E * E)
+PID_W     = 1 if N_PID   < 2 else _rtl_clog2(N_PID)
+IDX_W     = 1 if H       < 2 else _rtl_clog2(H)
+PTR_W     = 1 if (N_NZ_MAX + 1) < 2 else _rtl_clog2(N_NZ_MAX + 1)
+ENT_AW    = 1 if N_NZ_MAX       < 2 else _rtl_clog2(N_NZ_MAX)
+RPTR_AW   = 1 if (N_ROWS + 1)   < 2 else _rtl_clog2(N_ROWS + 1)
+FIFOB_W   = DATA_W + PID_W + CID_W
 
 CLK_NS = 10
 
@@ -69,7 +78,6 @@ def golden_fifo_b(matrix, wsps):
         pairs.extend(fm.pcid_to_cid_pid(axy, px, py, cx, cy, F, H, S))
     fifo_a = fm.route_to_fifo_a(pairs, F)
     fifo_b = fm.broadcast_to_fifo_b(fifo_a, wsps)
-    # Mask to RTL widths so signed/unsigned comparisons line up.
     act_mask = (1 << DATA_W) - 1
     cid_mask = (1 << CID_W)  - 1
     return [[(a & act_mask, c & cid_mask, p) for (a, c, p) in fbk] for fbk in fifo_b]
@@ -102,7 +110,7 @@ def _rand_wsps(rng):
 
 
 def _pack_wsp(wsps):
-    """list[N_PE][N_PID] -> packed bus. MSB-first by PID, matches RTL wsp[k][N_PID-1-pid]."""
+    """list[N_PE][N_PID] -> packed bus, MSB-first by PID (matches RTL)."""
     val = 0
     for k in range(N_PE):
         for p in range(N_PID):
@@ -115,73 +123,110 @@ def _pack_wsp(wsps):
 # Driver / monitor
 # ---------------------------------------------------------------------------
 async def reset(dut):
-    dut.rst_n.value          = 0
-    dut.row_ptr_valid.value  = 0
-    dut.row_ptr_data.value   = 0
-    dut.entry_valid.value    = 0
-    dut.entry_value.value    = 0
-    dut.entry_col.value      = 0
-    dut.s2_start.value       = 0
-    dut.wsp.value            = 0
-    dut.fifob_rd_ready.value = 0
+    dut.rst_n.value             = 0
+    dut.fill_entry_we.value     = 0
+    dut.fill_entry_addr.value   = 0
+    dut.fill_entry_value.value  = 0
+    dut.fill_entry_col.value    = 0
+    dut.fill_rptr_we.value      = 0
+    dut.fill_rptr_addr.value    = 0
+    dut.fill_rptr_data.value    = 0
+    dut.scan_start.value        = 0
+    dut.scan_n_rows.value       = 0
+    dut.scan_base_row.value     = 0
+    dut.s2_start.value          = 0
+    dut.wsp.value               = 0
+    dut.fifob_rd_ready.value    = 0
     for _ in range(4):
         await RisingEdge(dut.clk)
     dut.rst_n.value = 1
     await RisingEdge(dut.clk)
 
 
-async def _send_row_ptr(dut, ptr):
-    dut.row_ptr_valid.value = 1
-    dut.row_ptr_data.value  = ptr
-    while True:
+async def fill_sram(dut, matrix):
+    """Encode `matrix` as CSR and stream it into both fill ports.
+
+    Writes:
+      - row_ptr SRAM:  N_ROWS + 1 pointers
+      - entry SRAM:    N non-zero {value, col} pairs (row-major)
+
+    One write per cycle on each port; the two streams can be sequenced
+    serially because Stage 2 won't start until scan_done.
+    """
+    values, col_idx, row_ptr = fm.dense_to_csr(matrix)
+    if len(values) > N_NZ_MAX:
+        raise ValueError(f"matrix has {len(values)} non-zeros but entry SRAM "
+                         f"only holds {N_NZ_MAX}")
+
+    # Fill row_ptr SRAM (N_ROWS+1 entries; pad upper slots with the last value
+    # so any out-of-range scan still terminates cleanly).
+    dut.fill_rptr_we.value = 1
+    last_ptr = row_ptr[-1]
+    for r in range(N_ROWS + 1):
+        ptr = row_ptr[r] if r < len(row_ptr) else last_ptr
+        dut.fill_rptr_addr.value = r
+        dut.fill_rptr_data.value = ptr
         await RisingEdge(dut.clk)
-        if dut.row_ptr_ready.value == 1:
-            break
-    dut.row_ptr_valid.value = 0
+    dut.fill_rptr_we.value   = 0
+    dut.fill_rptr_addr.value = 0
+    dut.fill_rptr_data.value = 0
+
+    # Fill entry SRAM ({value, col} per non-zero).
+    val_mask = (1 << DATA_W) - 1
+    dut.fill_entry_we.value = 1
+    for k in range(len(values)):
+        dut.fill_entry_addr.value  = k
+        dut.fill_entry_value.value = values[k] & val_mask
+        dut.fill_entry_col.value   = col_idx[k]
+        await RisingEdge(dut.clk)
+    dut.fill_entry_we.value    = 0
+    dut.fill_entry_addr.value  = 0
+    dut.fill_entry_value.value = 0
+    dut.fill_entry_col.value   = 0
+    await RisingEdge(dut.clk)
 
 
-async def _send_entry(dut, value, col):
-    dut.entry_valid.value = 1
-    dut.entry_value.value = value & ((1 << DATA_W) - 1)
-    dut.entry_col.value   = col
-    while True:
-        await RisingEdge(dut.clk)
-        if dut.entry_ready.value == 1:
+async def trigger_scan(dut, n_rows=None, base_row=0, timeout=200000):
+    """Pulse scan_start, wait for scan_done, then drain the inner pipeline.
+
+    Returns the cycle count from start to done.
+    """
+    if n_rows is None:
+        n_rows = H
+    dut.scan_n_rows.value = n_rows
+    dut.scan_base_row.value = base_row
+    await RisingEdge(dut.clk)
+    dut.scan_start.value = 1
+    await RisingEdge(dut.clk)
+    dut.scan_start.value = 0
+
+    cycles = 0
+    while cycles < timeout:
+        await ReadOnly()
+        if int(dut.scan_done.value) == 1:
             break
-    dut.entry_valid.value = 0
+        await RisingEdge(dut.clk)
+        cycles += 1
+    await RisingEdge(dut.clk)
+
+    # Combinational pipeline + 1-cycle FIFO-A write -- give it a few cycles
+    # to settle so Stage 2 sees the final FIFO-A contents.
+    for _ in range(6):
+        await RisingEdge(dut.clk)
+    return cycles
 
 
 async def feed_matrix(dut, matrix):
-    values, col_idx, row_ptr = fm.dense_to_csr(matrix)
-
-    async def drive_rptr():
-        for ptr in row_ptr:
-            await _send_row_ptr(dut, ptr)
-
-    async def drive_entries():
-        for v, c in zip(values, col_idx):
-            await _send_entry(dut, v, c)
-
-    rt = cocotb.start_soon(drive_rptr())
-    et = cocotb.start_soon(drive_entries())
-    await rt
-    await et
-    # let the last accepted entry land in FIFO-A
-    for _ in range(5):
-        await RisingEdge(dut.clk)
+    """Fill the SRAM with `matrix` and scan all H rows."""
+    await fill_sram(dut, matrix)
+    await trigger_scan(dut, n_rows=H, base_row=0)
 
 
 async def run_stage2_and_drain(dut, timeout=200000):
-    """Pulse s2_start, drain FIFO-B concurrently, return list[N_PE] of (a,p,c).
-
-    fifob_rd_ready is held high throughout so the FIFO-B's never act as a queue;
-    that gives the simplest functional check. (A separate test exercises FIFO-B
-    backpressure.)
-    """
+    """Pulse s2_start, drain FIFO-B concurrently, return list[N_PE] of (a,p,c)."""
     collected = [[] for _ in range(N_PE)]
     dut.fifob_rd_ready.value = (1 << N_PE) - 1
 
-    # Single-cycle start pulse.
     await RisingEdge(dut.clk)
     dut.s2_start.value = 1
     await RisingEdge(dut.clk)
@@ -194,7 +239,7 @@ async def run_stage2_and_drain(dut, timeout=200000):
         await ReadOnly()
         vbits = int(dut.fifob_rd_valid.value)
         if vbits != 0:
-            binstr = dut.fifob_rd_data.value.binstr   # MSB-first, len = N_PE*FIFOB_W
+            binstr = dut.fifob_rd_data.value.binstr   # MSB-first
             L = len(binstr)
             for k in range(N_PE):
                 if (vbits >> k) & 1:
@@ -204,7 +249,6 @@ async def run_stage2_and_drain(dut, timeout=200000):
                     pid = (payload >> CID_W) & ((1 << PID_W) - 1)
                     axy = (payload >> (CID_W + PID_W)) & ((1 << DATA_W) - 1)
                     collected[k].append((axy, pid, cid))
-        # Sample done before the next edge -- it's a 1-cycle pulse.
         if int(dut.s2_done.value) == 1:
             seen_done = True
         await RisingEdge(dut.clk)
@@ -212,9 +256,6 @@ async def run_stage2_and_drain(dut, timeout=200000):
             drain_extra += 1
             if drain_extra >= 2:
                 break
-        elif vbits == 0 and not seen_done:
-            # Nothing to drain yet, keep waiting.
-            pass
         guard += 1
 
     dut.fifob_rd_ready.value = 0
@@ -233,7 +274,7 @@ def check_against_golden(dut, got, matrix, wsps, name):
         )
     total = sum(len(s) for s in got)
     dut._log.info(f"[{name}] PASS -- {total} entries across {N_PE} FIFO-B's "
-                  f"(H={H} F={F} S={S} N_PE={N_PE} E={E})")
+                  f"(H={H} F={F} S={S} N_PE={N_PE} N_ROWS={N_ROWS} E={E})")
 
 
 async def run_case(dut, matrix, wsps, name):
@@ -279,7 +320,7 @@ async def test_random(dut):
     """Several randomized matrices x randomized WSPs."""
     cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
     rng = random.Random(0xA9)
-    for i, density in enumerate([0.1, 0.25, 0.5, 0.9]):
+    for density in [0.1, 0.25, 0.5, 0.9]:
         m = _rand_matrix(rng, density)
         wsps = _rand_wsps(rng)
         await run_case(dut, m, wsps, f"random[d={density}]")
@@ -296,7 +337,6 @@ async def test_paper_toy(dut):
          [0,  2, 0],
          [0,  0, -2]]
     wsps = [[1, 0, 1, 0], [0, 1, 1, 0]][:N_PE]
-    # If we have more PEs than the toy example covers, pad with all-zero WSPs.
     while len(wsps) < N_PE:
         wsps.append([0] * N_PID)
     await run_case(dut, m, wsps, "paper_toy")

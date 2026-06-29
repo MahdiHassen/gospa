@@ -3,21 +3,23 @@
 // =============================================================================
 // GoSPA Project -- Team 19, ECE 720 (Spring 2026)
 //
-// Ties the Stage-1 datapath together:
+// Ties the Stage-1 datapath together. Front-end CSR decoding lives upstream
+// of this module now (the APU top instantiates act_sram_scanner which emits
+// (val, x, y) directly from the activation SRAM). This module accepts that
+// stream and produces the FIFO-A bank:
 //
-//   CSR streams                                          FIFO-A bank
-//   (row_ptr, entries)                                   (F^2 slots, PID-indexed)
-//        |                                                     ^
-//        v                                                     |
-//   csr_decode --(val,x,y)--> zero_act --(val,x,y)--> position_encode
-//                                                          |
-//                                              (val, Px,Py,Cx,Cy)
-//                                                          v
-//                                                   idgen (G x G units)
-//                                                          |
-//                                  up to G^2 parallel (valid, a_xy, cid, pid)
-//                                                          |
-//                                              route each to FIFO-A[pid]
+//       (val, x, y) handshake (in_valid/in_ready)
+//                       |
+//                       v
+//                  zero_act --(val,x,y)--> position_encode
+//                                                |
+//                                    (val, Px,Py,Cx,Cy)
+//                                                v
+//                                         idgen (G x G units)
+//                                                |
+//                       up to G^2 parallel (valid, a_xy, cid, pid)
+//                                                |
+//                                    route each to FIFO-A[pid]
 //
 // FIFO-A[k] stores { activation_value, CID }; PID is IMPLICIT (= the slot
 // index k), so it is not stored. Stage 2 (router) drains these read ports.
@@ -66,15 +68,12 @@ module apu_stage1 #(
     input  wire  logic                              clk,
     input  wire  logic                              rst_n,
 
-    // -- CSR input streams (drive csr_decode) ---------------------------------
-    input  wire  logic                              row_ptr_valid,
-    input  wire  logic [$clog2(H*H):0]              row_ptr_data,
-    output logic                                    row_ptr_ready,
-
-    input  wire  logic                              entry_valid,
-    input  wire  logic [DATA_W-1:0]                 entry_value,
-    input  wire  logic [IDX_W-1:0]                  entry_col,
-    output logic                                    entry_ready,
+    // -- (val, x, y) handshake input (from act_sram_scanner upstream) --------
+    input  wire  logic                              in_valid,
+    input  wire  logic [DATA_W-1:0]                 in_value,
+    input  wire  logic [IDX_W-1:0]                  in_x,
+    input  wire  logic [IDX_W-1:0]                  in_y,
+    output logic                                    in_ready,
 
     // -- FIFO-A read ports (one per PID slot; consumed by Stage 2) -------------
     output logic [N_PID-1:0]                        fifoa_rd_valid,
@@ -87,10 +86,7 @@ module apu_stage1 #(
     // -------------------------------------------------------------------------
     // Inter-stage nets (valid/ready handshake on each hop)
     // -------------------------------------------------------------------------
-    // csr_decode -> zero_act
-    logic                cz_valid, cz_ready;
-    logic [DATA_W-1:0]   cz_value;
-    logic [IDX_W-1:0]    cz_x, cz_y;
+    // upstream handshake feeds zero_act directly (csr_decode lives outside).
 
     // zero_act -> position_encode
     logic                zp_valid, zp_ready;
@@ -116,34 +112,14 @@ module apu_stage1 #(
     logic                           s1_ready;    // all targeted FIFO-As can accept
 
     // -------------------------------------------------------------------------
-    // CSR decode : CSR streams -> (value, x, y)
-    // -------------------------------------------------------------------------
-    csr_decode #(.H(H), .DATA_W(DATA_W)) u_csr_decode (
-        .clk          (clk),
-        .rst_n        (rst_n),
-        .row_ptr_valid(row_ptr_valid),
-        .row_ptr_data (row_ptr_data),
-        .row_ptr_ready(row_ptr_ready),
-        .entry_valid  (entry_valid),
-        .entry_value  (entry_value),
-        .entry_col    (entry_col),
-        .entry_ready  (entry_ready),
-        .out_valid    (cz_valid),
-        .out_value    (cz_value),
-        .out_x        (cz_x),
-        .out_y        (cz_y),
-        .out_ready    (cz_ready)
-    );
-
-    // -------------------------------------------------------------------------
     // Zero-activation filter : drop a_xy == 0 before IDGen
     // -------------------------------------------------------------------------
     zero_act #(.H(H), .DATA_W(DATA_W)) u_zero_act (
-        .in_valid (cz_valid),
-        .in_value (cz_value),
-        .in_x     (cz_x),
-        .in_y     (cz_y),
-        .in_ready (cz_ready),
+        .in_valid (in_valid),
+        .in_value (in_value),
+        .in_x     (in_x),
+        .in_y     (in_y),
+        .in_ready (in_ready),
         .out_valid(zp_valid),
         .out_value(zp_value),
         .out_x    (zp_x),

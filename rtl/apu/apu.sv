@@ -1,52 +1,76 @@
 // =============================================================================
-// apu.sv -- APU Top Level (Stage 1 + Stage 2)
+// apu.sv -- APU Top Level (CSR Activation SRAM -> Stage 1 -> Stage 2)
 // =============================================================================
 // GoSPA Project -- Team 19, ECE 720 (Spring 2026)
 //
-// CSR streams --> apu_stage1 (FIFO-A bank) --> apu_stage2 (FIFO-B bank) --> PEs
+// Pipeline (~1 non-zero per cycle steady-state, modulo SRAM read latency):
 //
-// Two-phase pass:
-//   1) Drive CSR until row_ptr / entry handshakes finish (FIFO-A fills).
-//   2) Pulse `s2_start`; routing drains FIFO-A in PID order, WSP-multicasting
-//      into the per-PE FIFO-Bs. `s2_done` pulses on the last lane drain.
+//   {entries SRAM, row_ptr SRAM}  <-- fill from DRAM (TB model)
+//             |
+//             v
+//   [act_sram_scanner]  --(val, x=row, y=col)-->  [apu_stage1]
+//                                                      | F^2 FIFO-A slots
+//                                                      v
+//                                                 [apu_stage2]  --> N_PE FIFO-Bs
 //
-// Backpressure is end-to-end: a full FIFO-B stalls routing, which freezes the
-// FIFO-A drain, which can in turn freeze Stage 1's CSR ingest if the writer
-// was filling FIFO-A concurrently.
+// Per-input-channel sequence:
+//   1) Fill the row_ptr SRAM (N_ROWS+1 pointers) and the entry SRAM
+//      (N_NZ_MAX {value, col} words) via the two fill ports.
+//   2) Pulse scan_start with n_rows + base_row. scan_busy=1 while the FSM
+//      walks the CSR; scan_done pulses when the last tuple is accepted.
+//   3) Pulse s2_start; routing drains FIFO-A and multicasts WSP-gated
+//      entries into per-PE FIFO-Bs. s2_done pulses on the last lane drain.
+//
+// Backpressure end-to-end (FIFO-B full -> routing stall -> FIFO-A drain
+// stall -> Stage 1 stall -> scanner stall via out_ready).
 // =============================================================================
 
 `default_nettype none
 
 module apu #(
-    parameter int H      = 32,   // activation map (H x H)
-    parameter int F      = 3,    // kernel size (F x F)
-    parameter int S      = 1,    // stride
-    parameter int N_PE   = 8,    // number of PEs / FIFO-Bs
-    parameter int DATA_W = 16,
-    parameter int FIFO_D = 64,
+    parameter int H        = 32,   // activation map (H x H)
+    parameter int F        = 3,    // kernel size (F x F)
+    parameter int S        = 1,    // stride
+    parameter int N_PE     = 8,    // number of PEs / FIFO-Bs
+    parameter int N_ROWS   = 32,   // rows scanner can hold (rptr SRAM depth - 1)
+    parameter int N_NZ_MAX = 1024, // max non-zeros stored in entry SRAM
+    parameter int DATA_W   = 16,
+    parameter int FIFO_D   = 64,
 
     // -- Derived widths ------------------------------------------------------
-    localparam int E       = (H - F)/S + 1,
-    localparam int N_PID   = F*F,
-    localparam int IDX_W   = (H     < 2) ? 1 : $clog2(H),
-    localparam int CID_W   = (E*E   < 2) ? 1 : $clog2(E*E),
-    localparam int PID_W   = (N_PID < 2) ? 1 : $clog2(N_PID),
-    localparam int FIFOA_W = DATA_W + CID_W,
-    localparam int FIFOB_W = DATA_W + PID_W + CID_W,
-    localparam int CNT_W   = $clog2(FIFO_D) + 1
+    localparam int E         = (H - F)/S + 1,
+    localparam int N_PID     = F*F,
+    localparam int IDX_W     = (H     < 2) ? 1 : $clog2(H),
+    localparam int CID_W     = (E*E   < 2) ? 1 : $clog2(E*E),
+    localparam int PID_W     = (N_PID < 2) ? 1 : $clog2(N_PID),
+    localparam int FIFOA_W   = DATA_W + CID_W,
+    localparam int FIFOB_W   = DATA_W + PID_W + CID_W,
+    localparam int CNT_W     = $clog2(FIFO_D) + 1,
+    localparam int PTR_W     = (N_NZ_MAX + 1 < 2) ? 1 : $clog2(N_NZ_MAX + 1),
+    localparam int ENT_AW    = (N_NZ_MAX < 2)     ? 1 : $clog2(N_NZ_MAX),
+    localparam int RPTR_AW   = (N_ROWS + 1 < 2)   ? 1 : $clog2(N_ROWS + 1),
+    localparam int N_CNT_W   = (N_ROWS + 1 < 2)   ? 1 : $clog2(N_ROWS + 1)
 )(
     input  wire  logic                              clk,
     input  wire  logic                              rst_n,
 
-    // -- CSR input (Stage 1 producer) ----------------------------------------
-    input  wire  logic                              row_ptr_valid,
-    input  wire  logic [$clog2(H*H):0]              row_ptr_data,
-    output logic                                    row_ptr_ready,
+    // -- Entry SRAM fill (one {value, col} per cycle) ------------------------
+    input  wire  logic                              fill_entry_we,
+    input  wire  logic [ENT_AW-1:0]                 fill_entry_addr,
+    input  wire  logic [DATA_W-1:0]                 fill_entry_value,
+    input  wire  logic [IDX_W-1:0]                  fill_entry_col,
 
-    input  wire  logic                              entry_valid,
-    input  wire  logic [DATA_W-1:0]                 entry_value,
-    input  wire  logic [IDX_W-1:0]                  entry_col,
-    output logic                                    entry_ready,
+    // -- Row-pointer SRAM fill (one pointer per cycle) -----------------------
+    input  wire  logic                              fill_rptr_we,
+    input  wire  logic [RPTR_AW-1:0]                fill_rptr_addr,
+    input  wire  logic [PTR_W-1:0]                  fill_rptr_data,
+
+    // -- Scan control --------------------------------------------------------
+    input  wire  logic                              scan_start,
+    input  wire  logic [N_CNT_W-1:0]                scan_n_rows,
+    input  wire  logic [IDX_W-1:0]                  scan_base_row,
+    output logic                                    scan_busy,
+    output logic                                    scan_done,
 
     // -- Stage 2 framing -----------------------------------------------------
     input  wire  logic                              s2_start,
@@ -63,7 +87,39 @@ module apu #(
 );
 
     // -------------------------------------------------------------------------
-    // FIFO-A bank crosses the Stage 1 / Stage 2 boundary
+    // Activation SRAM (CSR) + scan FSM
+    // -------------------------------------------------------------------------
+    logic                scan_valid;
+    logic [DATA_W-1:0]   scan_value;
+    logic [IDX_W-1:0]    scan_x, scan_y;
+    logic                scan_ready;
+
+    act_sram_scanner #(
+        .H(H), .N_ROWS(N_ROWS), .N_NZ_MAX(N_NZ_MAX), .DATA_W(DATA_W)
+    ) u_scanner (
+        .clk               (clk),
+        .rst_n             (rst_n),
+        .fill_entry_we     (fill_entry_we),
+        .fill_entry_addr   (fill_entry_addr),
+        .fill_entry_value  (fill_entry_value),
+        .fill_entry_col    (fill_entry_col),
+        .fill_rptr_we      (fill_rptr_we),
+        .fill_rptr_addr    (fill_rptr_addr),
+        .fill_rptr_data    (fill_rptr_data),
+        .scan_start        (scan_start),
+        .scan_n_rows       (scan_n_rows),
+        .scan_base_row     (scan_base_row),
+        .scan_busy         (scan_busy),
+        .scan_done         (scan_done),
+        .out_valid         (scan_valid),
+        .out_value         (scan_value),
+        .out_x             (scan_x),
+        .out_y             (scan_y),
+        .out_ready         (scan_ready)
+    );
+
+    // -------------------------------------------------------------------------
+    // Stage 1 / FIFO-A bank
     // -------------------------------------------------------------------------
     logic [N_PID-1:0]               fa_rd_valid;
     logic [N_PID-1:0][FIFOA_W-1:0]  fa_rd_data;
@@ -75,13 +131,11 @@ module apu #(
     ) u_stage1 (
         .clk           (clk),
         .rst_n         (rst_n),
-        .row_ptr_valid (row_ptr_valid),
-        .row_ptr_data  (row_ptr_data),
-        .row_ptr_ready (row_ptr_ready),
-        .entry_valid   (entry_valid),
-        .entry_value   (entry_value),
-        .entry_col     (entry_col),
-        .entry_ready   (entry_ready),
+        .in_valid      (scan_valid),
+        .in_value      (scan_value),
+        .in_x          (scan_x),
+        .in_y          (scan_y),
+        .in_ready      (scan_ready),
         .fifoa_rd_valid(fa_rd_valid),
         .fifoa_rd_data (fa_rd_data),
         .fifoa_rd_ready(fa_rd_ready),

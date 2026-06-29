@@ -36,8 +36,9 @@ endif
 #    -> idgen -> FIFO-A bank.  NOTE: idgen.sv crashes Verilator < 5.020, so run
 #    this target with SIM=icarus unless your Verilator is new enough.
 ifeq ($(MODULE),test_apu_stage1)
+    # apu_stage1 now takes (val, x, y) directly (csr_decode lives upstream of
+    # the APU as part of the activation SRAM scanner in act_sram_scanner.sv).
     VERILOG_SOURCES := $(REPO_ROOT)/rtl/common/fifo.sv \
-                       $(RTL_DIR)/csr_decode.sv \
                        $(RTL_DIR)/zero_act.sv \
                        $(RTL_DIR)/position_encode.sv \
                        $(RTL_DIR)/idgen.sv \

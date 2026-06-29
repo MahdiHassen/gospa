@@ -1,10 +1,10 @@
 <testsuites name="results">
   <testsuite name="all" package="all">
-    <property name="random_seed" value="1782374202" />
-    <testcase name="test_empty" classname="test_apu_stage1" file="/Users/mahdi/team-19/testing/apu/stage1/test_apu_stage1.py" lineno="210" time="0.003792285919189453" sim_time_ns="230.0" ratio_time="60649.43543316987" />
-    <testcase name="test_single_nonzero" classname="test_apu_stage1" file="/Users/mahdi/team-19/testing/apu/stage1/test_apu_stage1.py" lineno="217" time="0.003508329391479492" sim_time_ns="260.0" ratio_time="74109.34692490655" />
-    <testcase name="test_dense" classname="test_apu_stage1" file="/Users/mahdi/team-19/testing/apu/stage1/test_apu_stage1.py" lineno="226" time="0.05792522430419922" sim_time_ns="1610.0" ratio_time="27794.454304483115" />
-    <testcase name="test_random" classname="test_apu_stage1" file="/Users/mahdi/team-19/testing/apu/stage1/test_apu_stage1.py" lineno="234" time="0.18910694122314453" sim_time_ns="5560.0" ratio_time="29401.353350849502" />
-    <testcase name="test_paper_toy" classname="test_apu_stage1" file="/Users/mahdi/team-19/testing/apu/stage1/test_apu_stage1.py" lineno="244" time="6.604194641113281e-05" sim_time_ns="0.0" ratio_time="0.0" />
+    <property name="random_seed" value="1782705217" />
+    <testcase name="test_empty" classname="test_apu_stage1" file="/Users/mahdi/team-19/testing/apu/stage1/test_apu_stage1.py" lineno="198" time="0.001734018325805664" sim_time_ns="110.0" ratio_time="63436.46913240753" />
+    <testcase name="test_single_nonzero" classname="test_apu_stage1" file="/Users/mahdi/team-19/testing/apu/stage1/test_apu_stage1.py" lineno="205" time="0.0014657974243164062" sim_time_ns="140.0" ratio_time="95511.15159401431" />
+    <testcase name="test_dense" classname="test_apu_stage1" file="/Users/mahdi/team-19/testing/apu/stage1/test_apu_stage1.py" lineno="214" time="0.05426502227783203" sim_time_ns="1490.0" ratio_time="27457.83448445546" />
+    <testcase name="test_random" classname="test_apu_stage1" file="/Users/mahdi/team-19/testing/apu/stage1/test_apu_stage1.py" lineno="222" time="0.16711878776550293" sim_time_ns="4840.0" ratio_time="28961.435543628835" />
+    <testcase name="test_paper_toy" classname="test_apu_stage1" file="/Users/mahdi/team-19/testing/apu/stage1/test_apu_stage1.py" lineno="232" time="5.221366882324219e-05" sim_time_ns="0.0" ratio_time="0.0" />
   </testsuite>
 </testsuites>
