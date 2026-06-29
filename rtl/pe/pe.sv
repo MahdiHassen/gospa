@@ -261,7 +261,13 @@ module pe #(
                 end
             end
             S_RUN: begin
-                if (arb_valid) begin
+                if (wload_done) begin
+                    // Re-arm path: a fresh wload_done in S_RUN restarts the
+                    // warm sequence with the new SRAM contents (host has
+                    // overwritten weights via Port A). Issue slot 0 now.
+                    w_rd_en   = 1'b1;
+                    w_rd_addr = '0;
+                end else if (arb_valid) begin
                     w_rd_en   = 1'b1;
                     w_rd_addr = WSRAM_AW'(arb_lane) * WSRAM_AW'(N_PID)
                               + WSRAM_AW'(wptr[arb_lane]);
@@ -352,6 +358,26 @@ module pe #(
 
                 // ---------------------------------------------------------
                 S_RUN: begin
+                    if (wload_done) begin
+                        // Re-arm: host has rewritten the weight SRAM (and
+                        // optionally the WSPs); kick the warm sequence again
+                        // to refresh Curr/Next. pe_acc accumulators are NOT
+                        // touched (clear is tied 0) so partial sums persist
+                        // across the re-arm -- this is what makes back-to-back
+                        // input channels work end-to-end on one drain.
+                        for (int k = 0; k < N_MULTS; k++) begin
+                            n_weights[k] <= wload_count[k];
+                            have_curr[k] <= 1'b0;
+                            have_next[k] <= 1'b0;
+                            wptr[k]      <= WPTR_W'(2);
+                        end
+                        refill_in_flight <= '0;
+                        capture_valid_q  <= 1'b0;
+                        warm_addr_idx    <= WARM_W'(1);
+                        warm_cap_idx     <= '0;
+                        warm_cap_valid   <= 1'b1;
+                        state            <= S_WARM;
+                    end else begin
                     // 1) Capture any pending refill from previous cycle's
                     //    arbiter-issued read.
                     if (capture_valid_q) begin
@@ -390,6 +416,7 @@ module pe #(
                         // No arbiter activity this cycle.
                         capture_valid_q <= 1'b0;
                     end
+                    end  // not wload_done
                 end
 
                 default: state <= S_LOAD;
