@@ -131,7 +131,7 @@ module pe_array #(
     // Array-level drain status (any PE busy / falling edge done).
     assign drain_busy = |pe_busy;
     logic busy_q;
-    always_ff @(posedge clk or negedge rst_n) begin
+    always_ff @(posedge clk) begin
         if (!rst_n) busy_q <= 1'b0;
         else        busy_q <= drain_busy;
     end

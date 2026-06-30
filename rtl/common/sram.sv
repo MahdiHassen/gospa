@@ -116,7 +116,7 @@ module sram #(
     // -------------------------------------------------------------------------
     generate
         if (OUTPUT_REG) begin : gen_outreg
-            always_ff @(posedge clk or negedge rst_n) begin
+            always_ff @(posedge clk) begin
                 if (!rst_n) begin
                     a_rdata     <= '0;
                     a_rdata_vld <= 1'b0;

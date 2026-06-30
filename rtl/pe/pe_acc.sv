@@ -37,7 +37,7 @@ module pe_acc #(
     assign out_cid    = drain_idx;
     assign out_acc    = acc[drain_idx];
 
-    always_ff @(posedge clk or negedge rst_n) begin
+    always_ff @(posedge clk) begin
         if (!rst_n) begin
             draining  <= 1'b0;
             drain_idx <= '0;

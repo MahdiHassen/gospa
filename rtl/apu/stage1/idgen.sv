@@ -128,7 +128,7 @@ module idgen_unit #(
 
     generate
         if (PIPE) begin : g_pipe
-            always_ff @(posedge clk or negedge rst_n) begin
+            always_ff @(posedge clk) begin
                 if (!rst_n) begin
                     valid <= 1'b0; cid <= '0; pid <= '0; a_xy_out <= '0;
                 end else begin

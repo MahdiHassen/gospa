@@ -280,7 +280,7 @@ module pe #(
     // -------------------------------------------------------------------------
     // Sequencer
     // -------------------------------------------------------------------------
-    always_ff @(posedge clk or negedge rst_n) begin
+    always_ff @(posedge clk) begin
         if (!rst_n) begin
             state              <= S_LOAD;
             warm_addr_idx      <= '0;
@@ -468,7 +468,7 @@ module pe #(
     assign drain_busy = |pe_drain_busy_w;
 
     logic busy_q;
-    always_ff @(posedge clk or negedge rst_n) begin
+    always_ff @(posedge clk) begin
         if (!rst_n) busy_q <= 1'b0;
         else        busy_q <= drain_busy;
     end
