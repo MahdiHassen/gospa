@@ -428,29 +428,79 @@ module pe #(
     // Per-lane multiplier + accumulator. We pipe out_valid/cid/acc through an
     // internal wire so both the module output port AND drain_busy can read it
     // cleanly (one driver -> two readers).
+    //
+    // The multiply is PIPELINED: the product is registered (stage 1) before it
+    // is accumulated (stage 2 inside pe_acc). This breaks the long
+    //   FIFO-B -> mac_w mux -> 16x16 multiply -> 32b accumulate-RMW
+    // combinational path -- the product register is exactly the DSP block's
+    // output register on an FPGA. The CID and accumulate-enable are delayed one
+    // cycle so they stay aligned with the registered product.
+    //
+    // No accumulator hazard is introduced: the accumulate remains a single-cycle
+    // read-modify-write, so two back-to-back same-CID products land on
+    // consecutive cycles and each reads the prior cycle's committed value.
+    // To avoid dropping the trailing product, the accumulator drain is held off
+    // (acc_drain_pulse below) until the MAC pipeline has flushed.
     // -------------------------------------------------------------------------
     logic [N_MULTS-1:0]              pe_out_valid_w;
     logic [N_MULTS-1:0][CID_W-1:0]   pe_out_cid_w;
     logic [N_MULTS-1:0][ACC_W-1:0]   pe_out_acc_w;
     logic [N_MULTS-1:0]              pe_drain_busy_w;
 
+    // Per-lane stage-2 accumulate-enable (registered product valid). Held at
+    // module scope so the drain can wait for the MAC pipeline to flush.
+    logic [N_MULTS-1:0]              mac_en_q;
+
+    // Defer the accumulator drain until every lane's in-flight product has been
+    // accumulated (mac_en_q all 0) and no new product is being formed this
+    // cycle (!consume). Otherwise the trailing pipelined product would be
+    // dropped when pe_acc switches into drain-readout mode. drain_start is
+    // latched so a single-cycle pulse is not lost while we wait for the flush.
+    logic                            drain_req_q;
+    logic                            acc_drain_pulse;
+    assign acc_drain_pulse = (drain_start || drain_req_q)
+                          && (mac_en_q == '0) && !consume;
+
+    always_ff @(posedge clk) begin
+        if      (!rst_n)            drain_req_q <= 1'b0;
+        else if (acc_drain_pulse)   drain_req_q <= 1'b0;
+        else if (drain_start)       drain_req_q <= 1'b1;
+    end
+
     genvar k;
     /* verilator lint_off PINCONNECTEMPTY */
     generate
         for (k = 0; k < N_MULTS; k++) begin : g_lane
-            logic signed [PROD_W-1:0] prod_k;
+            // ----- Stage 1: multiply (combinational) -> product register -----
+            logic signed [PROD_W-1:0] prod_k;     // combinational product
+            logic signed [PROD_W-1:0] prod_q;     // registered product (DSP out reg)
+            logic        [CID_W-1:0]  cid_q;       // CID aligned to prod_q
+
             assign prod_k = b_act * $signed(mac_w[k]);
 
+            always_ff @(posedge clk) begin
+                if (!rst_n) begin
+                    prod_q      <= '0;
+                    cid_q       <= '0;
+                    mac_en_q[k] <= 1'b0;
+                end else begin
+                    prod_q      <= prod_k;
+                    cid_q       <= b_cid;
+                    mac_en_q[k] <= consume && mac_en[k] && !drain_busy;
+                end
+            end
+
+            // ----- Stage 2: accumulate the registered product -----
             pe_acc #(
                 .N_CID(N_CID), .ACC_WIDTH(ACC_W), .PROD_WIDTH(PROD_W)
             ) u_acc (
                 .clk        (clk),
                 .rst_n      (rst_n),
                 .clear      (1'b0),
-                .add_en     (consume && mac_en[k] && !drain_busy),
-                .add_cid    (b_cid),
-                .add_data   (prod_k),
-                .drain_start(drain_start),
+                .add_en     (mac_en_q[k]),
+                .add_cid    (cid_q),
+                .add_data   (prod_q),
+                .drain_start(acc_drain_pulse),
                 .drain_busy (pe_drain_busy_w[k]),
                 .drain_done (),
                 .out_valid  (pe_out_valid_w[k]),
