@@ -6,7 +6,6 @@
 //   - Single-port or simple dual-port configurations (USE_DUAL_PORT param)
 //   - Synchronous read: 1-cycle latency, or 2 cycles with OUTPUT_REG=1
 //   - Whole-word writes
-//   - Optional memory initialisation from a hex file ($readmemh)
 //   - Configurable data / address widths and depth
 //   - Infers FPGA block RAM (OUTPUT_REG=1 maps to the BRAM output register)
 //
@@ -21,8 +20,7 @@ module sram #(
     parameter int  DATA_WIDTH    = 32,         // Width of one word
     parameter int  ADDR_WIDTH    = 12,         // log2(depth); depth = 4 K words
     parameter bit  USE_DUAL_PORT = 1'b1,       // 0 = single-port, 1 = dual-port
-    parameter bit  OUTPUT_REG    = 1'b1,       // Extra pipeline register on outputs
-    parameter string INIT_FILE   = ""          // Optional hex initialisation file
+    parameter bit  OUTPUT_REG    = 1'b1        // Extra pipeline register on outputs
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -57,13 +55,7 @@ module sram #(
     // Initialisation
     // -------------------------------------------------------------------------
     initial begin
-        if (INIT_FILE != "") begin
-            $readmemh(INIT_FILE, mem);
-            $display("[sram] Loaded %0s into SRAM (%0d x %0d-bit)",
-                     INIT_FILE, DEPTH, DATA_WIDTH);
-        end else begin
-            foreach (mem[i]) mem[i] = '0;
-        end
+        foreach (mem[i]) mem[i] = '0;
     end
 
     // -------------------------------------------------------------------------
@@ -136,17 +128,5 @@ module sram #(
             assign b_rdata_vld = b_vld_raw;
         end
     endgenerate
-
-    // -------------------------------------------------------------------------
-    // Simulation assertions
-    // -------------------------------------------------------------------------
-    // synthesis translate_off
-    always @(posedge clk) begin
-        if (a_en && a_addr >= DEPTH)
-            $fatal(1, "[sram_model] Port A address 0x%0h out of range!", a_addr);
-        if (USE_DUAL_PORT && b_en && b_addr >= DEPTH)
-            $fatal(1, "[sram_model] Port B address 0x%0h out of range!", b_addr);
-    end
-    // synthesis translate_on
 
 endmodule

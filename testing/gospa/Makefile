@@ -28,7 +28,9 @@ VERILOG_SOURCES := $(RTL_DIR)/common/fifo.sv \
                    $(RTL_DIR)/apu/act_sram_scanner.sv \
                    $(RTL_DIR)/apu/wsp_file.sv \
                    $(RTL_DIR)/apu/apu.sv \
-                   $(RTL_DIR)/pe/pe_acc.sv \
+                   $(RTL_DIR)/pe/pe_lane.sv \
+                   $(RTL_DIR)/pe/pe_window.sv \
+                   $(RTL_DIR)/pe/pe_wmem.sv \
                    $(RTL_DIR)/pe/pe.sv \
                    $(RTL_DIR)/pe/pe_array.sv \
                    $(RTL_DIR)/gospa.sv
