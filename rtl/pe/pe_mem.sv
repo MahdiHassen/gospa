@@ -1,23 +1,24 @@
 // =============================================================================
-// pe_wmem.sv -- PE weight memory: shared on-chip SRAM + fill bookkeeping
+// pe_mem.sv -- PE weight memory: per-lane banked SRAM + fill bookkeeping
 // =============================================================================
 // GoSPA Project -- Team 19, ECE 720 (Spring 2026)
 //
-// Owns the per-PE weight SRAM and everything on the "load" side:
+// Owns the per-PE weight memory and everything on the "load" side:
 //   - Port A: one weight per cycle {wfill_val, wfill_pid} appended to lane's
 //     slots. slot, per-lane count (wfill_cnt) and WSP (wsp_q) are all DERIVED
 //     from this stream; the host drives no separate slot / count / WSP ports.
 //   - fill_restart: a bare wload_done re-arms the same weights; the first
 //     wfill after an arm starts a fresh session (prior counts/WSP cleared).
-//   - Port B: single read port for the window (warm preload + run refill).
-//     1-cycle latency; read data is unpacked into rd_val / rd_pid.
+//   - Banked read side: one SRAM bank per lane, so every lane has its own
+//     read port and can fetch a weight independently every cycle (no arbiter).
+//     1-cycle latency; read data is unpacked into rd_val[k] / rd_pid[k].
 //
-// Address layout (both ports): addr = lane * NUM_PID + slot.
+// Within a bank, slot s holds the lane's s-th weight in PID order.
 // =============================================================================
 
 `default_nettype none
 
-module pe_wmem #(
+module pe_mem #(
     parameter int NUM_MULTS  = 4,
     parameter int NUM_PID    = 9,
     parameter int DATA_WIDTH = 16,
@@ -26,8 +27,7 @@ module pe_wmem #(
     localparam int PID_WIDTH   = (NUM_PID   < 2) ? 1 : $clog2(NUM_PID),
     localparam int LANE_WIDTH  = (NUM_MULTS < 2) ? 1 : $clog2(NUM_MULTS),
     localparam int RPTR_WIDTH  = $clog2(NUM_PID + 1),
-    localparam int WSRAM_DEPTH = NUM_MULTS * NUM_PID,
-    localparam int WSRAM_AW    = (WSRAM_DEPTH < 2) ? 1 : $clog2(WSRAM_DEPTH),
+    localparam int SLOT_WIDTH  = (NUM_PID < 2) ? 1 : $clog2(NUM_PID),
     localparam int WSRAM_DW    = DATA_WIDTH + PID_WIDTH
 )(
     input  logic                                  clk,
@@ -40,35 +40,34 @@ module pe_wmem #(
     input  logic signed [DATA_WIDTH-1:0]          wfill_val,
     input  logic                                  wload_done,
 
-    // -- Read port (Port B) -- driven by the window, 1-cycle latency ---------
-    input  logic                                  rd_en,
-    input  logic [WSRAM_AW-1:0]                   rd_addr,
-    output logic [DATA_WIDTH-1:0]                 rd_val,
-    output logic [PID_WIDTH-1:0]                  rd_pid,
+    // -- Per-lane read ports (Port B per bank) -- 1-cycle latency ------------
+    input  logic [NUM_MULTS-1:0]                  rd_en,
+    input  logic [NUM_MULTS-1:0][SLOT_WIDTH-1:0]  rd_slot,
+    output logic [NUM_MULTS-1:0][DATA_WIDTH-1:0]  rd_val,
+    output logic [NUM_MULTS-1:0][PID_WIDTH-1:0]   rd_pid,
 
-    // -- Derived per-lane state exported to the window / action-eval ---------
-    output logic [NUM_MULTS-1:0][RPTR_WIDTH-1:0]  wfill_cnt,   // live weight count
+    // -- Derived per-lane state exported to pe_fetch / action-eval -----------
     output logic [NUM_MULTS-1:0][NUM_PID-1:0]     wsp_q        // weight sparsity pattern
 );
 
     // -------------------------------------------------------------------------
-    // Fill pointer = # weights written this session = next slot to write; also
-    // the arm-time weight count. fill_restart marks the first write of a new
-    // session, which clears the prior counts/WSP.
+    // Fill pointer = # weights written this session = next slot to write.
+    // fill_restart marks the first write of a new session, which clears the
+    // prior count/WSP. The count is internal now (pe_fetch derives its live
+    // weight count from popcount(wsp_q)).
     // -------------------------------------------------------------------------
     logic                   fill_restart;
-    logic [RPTR_WIDTH-1:0]  wfill_slot_eff;
-    logic [WSRAM_AW-1:0]    wfill_addr;
-    logic [WSRAM_DW-1:0]    w_rd_data;
+    logic [SLOT_WIDTH-1:0]  wfill_slot_eff;
+    logic [NUM_MULTS-1:0][RPTR_WIDTH-1:0]  wfill_cnt;
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            wfill_cnt    <= '0; fill_restart <= 1'b0;
-
-            for (int k = 0; k < NUM_MULTS; k++) 
+            wfill_cnt    <= '0;
+            fill_restart <= 1'b0;
+            for (int k = 0; k < NUM_MULTS; k++)
                 wsp_q[k] <= '0;
         end else begin
-            if (wload_done) 
+            if (wload_done)
                 fill_restart <= 1'b1;
 
             if (wfill_we) begin
@@ -87,36 +86,45 @@ module pe_wmem #(
     end
 
     // -------------------------------------------------------------------------
-    // Shared weight SRAM (Port A = fill, Port B = window scanner/refill).
+    // Per-lane weight SRAM banks. Port A = fill (only the addressed lane),
+    // Port B = that lane's independent read port.
     // -------------------------------------------------------------------------
-    /* verilator lint_off PINCONNECTEMPTY */
-    sram #(
-        .DATA_WIDTH    (WSRAM_DW),
-        .ADDR_WIDTH    (WSRAM_AW),
-        .USE_DUAL_PORT (1'b1),
-        .OUTPUT_REG    (1'b0)
-    ) u_wsram (
-        .clk         (clk),
-        .rst_n       (rst_n),
-        .a_en        (wfill_we),
-        .a_we        (wfill_we),
-        .a_addr      (wfill_addr),
-        .a_wdata     ({wfill_val, wfill_pid}),
-        .a_rdata     (),
-        .a_rdata_vld (),
-        .b_en        (rd_en),
-        .b_addr      (rd_addr),
-        .b_rdata     (w_rd_data),
-        .b_rdata_vld ()
-    );
-    /* verilator lint_on PINCONNECTEMPTY */
+    genvar k;
+    generate
+        for (k = 0; k < NUM_MULTS; k++) begin : g_bank
+            logic                  bank_we;
+            logic [WSRAM_DW-1:0]   bank_rdata;
 
-    assign wfill_slot_eff = fill_restart ? RPTR_WIDTH'(0) : wfill_cnt[wfill_lane];
-    assign wfill_addr = WSRAM_AW'(wfill_lane) * WSRAM_AW'(NUM_PID) + WSRAM_AW'(wfill_slot_eff);
+            /* verilator lint_off PINCONNECTEMPTY */
+            sram #(
+                .DATA_WIDTH    (WSRAM_DW),
+                .ADDR_WIDTH    (SLOT_WIDTH),
+                .USE_DUAL_PORT (1'b1),
+                .OUTPUT_REG    (1'b0)
+            ) u_wsram (
+                .clk         (clk),
+                .rst_n       (rst_n),
+                .a_en        (bank_we),
+                .a_we        (bank_we),
+                .a_addr      (wfill_slot_eff),
+                .a_wdata     ({wfill_val, wfill_pid}),
+                .a_rdata     (),
+                .a_rdata_vld (),
+                .b_en        (rd_en[k]),
+                .b_addr      (rd_slot[k]),
+                .b_rdata     (bank_rdata),
+                .b_rdata_vld ()
+            );
+            /* verilator lint_on PINCONNECTEMPTY */
 
-    // Unpack read data (raw bits; $signed() applied at the multiplier).
-    assign rd_pid = w_rd_data[PID_WIDTH-1:0];
-    assign rd_val = w_rd_data[WSRAM_DW-1 -: DATA_WIDTH];
+            assign bank_we   = wfill_we && (wfill_lane == LANE_WIDTH'(k));
+            assign rd_pid[k] = bank_rdata[PID_WIDTH-1:0];
+            assign rd_val[k] = bank_rdata[WSRAM_DW-1 -: DATA_WIDTH];
+        end
+    endgenerate
+
+    assign wfill_slot_eff = fill_restart ? SLOT_WIDTH'(0)
+                                         : SLOT_WIDTH'(wfill_cnt[wfill_lane]);
 
 endmodule
 

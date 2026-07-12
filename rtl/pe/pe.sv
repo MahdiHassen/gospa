@@ -3,46 +3,21 @@
 // =============================================================================
 // GoSPA Project -- Team 19, ECE 720 (Spring 2026)
 //
-// V2 PE structure (this file is the top-level glue; the two big subsystems
-// live in their own modules):
-//   - pe_wmem   : shared on-chip weight SRAM (sram.sv) per PE + fill/WSP
-//                 bookkeeping. Depth NUM_MULTS*NUM_PID, width DATA_WIDTH+PID_WIDTH; each
-//                 word holds {value, pid}. Lane k's kernel lives at SRAM
-//                 addresses [k*NUM_PID, (k+1)*NUM_PID). Exports wfill_cnt / wsp_q.
-//   - pe_window : per-lane Curr/Next window, the warm-up preload, the per-lane
-//                 action-eval (IDLE/RETIRED/KEEP/UPDATE/SLIDE -> mac_en/mac_w),
-//                 and the round-robin refill arbiter -- the shared SRAM has one
-//                 read port, so at most one lane fetches its new Next per cycle.
-//                 While any lane needs a refill (slide) it de-asserts b_ready;
-//                 the activation isn't consumed until every non-IDLE /
-//                 non-RETIRED lane is in KEEP or UPDATE with a valid window.
-//                 Conservative; KEEP-heavy workloads still hit one act/cycle.
-//   - pe_lane   : one per output channel -- pipelined multiply + CID-indexed
-//                 accumulator + drain.
-//   - here      : glue + the array-level drain gating (hold the drain off until
-//                 every lane's MAC pipeline has flushed).
+// Top-level glue over three submodules, plus the array-level drain gating
+// (holds the drain off until every lane's MAC pipeline has flushed):
+//   - pe_mem   : per-lane weight SRAM bank + fill/WSP bookkeeping. Lane k's
+//                kernel lives in bank k, PID-sorted. Exports wsp_q.
+//   - pe_fetch : per lane, one of IDLE/KEEP/BANK/SKIP per beat -> mac_en/mac_w.
+//                A SKIP jumps straight to the needed slot (popcount of wsp below
+//                b_pid) and stalls one beat; b_ready drops only for SKIP lanes.
+//   - pe_lane  : one per output channel -- pipelined multiply + CID-indexed
+//                accumulator + drain.
 //
-// Per-lane WSP (NUM_PID bits, from pe_wmem) tells a lane which incoming PIDs
-// belong to its kernel; non-WSP PIDs are IDLE (no MAC, no slide).
-//
-// Per-lane action per FIFO-B activation (b_pid arrives monotone, gated
-// upstream by the union WSP):
-//   IDLE    : wsp[k][PID] == 0                  -> no MAC, no slide
-//   RETIRED : have_curr[k] == 0 (out of weights)-> no MAC, no slide
-//   KEEP    : PID == curr_pid[k]                -> MAC, no slide
-//   UPDATE  : PID == next_pid[k], have_next[k]  -> MAC, slide (refill Next)
-//   SLIDE   : PID neither -- need to advance    -> no MAC, slide (refill Next)
-//
-// Load sequence (host -> PE)
-//   1) For each lane k: stream {wfill_we, wfill_lane=k, wfill_pid, wfill_val}
-//      once per weight, in PID order. pe_wmem appends to the lane's SRAM slots,
-//      counts them, and sets the lane's WSP bit for each wfill_pid -- so the
-//      per-lane slot, weight count, and WSP are all DERIVED from this stream;
-//      the host drives no separate slot / count / WSP ports.
-//   2) Pulse wload_done. pe_window issues 2*NUM_MULTS SRAM reads to pre-load
-//      every lane's Curr and Next, then enters S_RUN. A bare wload_done with no
-//      new fills re-arms the SAME weights; the first wfill after an arm begins
-//      a fresh session (prior counts/WSP cleared).
+// Load sequence (host -> PE): stream {wfill_we, wfill_lane=k, wfill_pid,
+// wfill_val} once per weight per lane, in PID order -- slot, count, and WSP are
+// all DERIVED from this stream. Pulse wload_done to arm; a bare wload_done
+// re-arms the same weights, and the first wfill after an arm starts a fresh
+// session (prior count/WSP cleared).
 // =============================================================================
 
 `default_nettype none
@@ -58,9 +33,7 @@ module pe #(
     localparam int PID_WIDTH   = (NUM_PID   < 2) ? 1 : $clog2(NUM_PID),
     localparam int CID_WIDTH   = (NUM_CID   < 2) ? 1 : $clog2(NUM_CID),
     localparam int LANE_WIDTH  = (NUM_MULTS < 2) ? 1 : $clog2(NUM_MULTS),
-    localparam int RPTR_WIDTH  = $clog2(NUM_PID + 1),
-    localparam int WSRAM_DEPTH = NUM_MULTS * NUM_PID,
-    localparam int WSRAM_AW    = (WSRAM_DEPTH < 2) ? 1 : $clog2(WSRAM_DEPTH)
+    localparam int SLOT_WIDTH  = (NUM_PID < 2) ? 1 : $clog2(NUM_PID)
 )(
     input  logic                                 clk,
     input  logic                                 rst_n,
@@ -95,17 +68,15 @@ module pe #(
     // -------------------------------------------------------------------------
     // Signal declarations
     // -------------------------------------------------------------------------
-    // Weight-memory / window interface: wmem hands back SRAM read data plus the
-    // derived per-lane weight count (wfill_cnt) and WSP (wsp_q); the window
-    // drives the SRAM's single read port.
-    logic                                   rd_en;
-    logic [WSRAM_AW-1:0]                    rd_addr;
-    logic [DATA_WIDTH-1:0]                  rd_val;
-    logic [PID_WIDTH-1:0]                   rd_pid;
-    logic [NUM_MULTS-1:0][RPTR_WIDTH-1:0]   wfill_cnt;
+    // Weight-memory / fetch interface: pe_mem hands back per-lane SRAM read data
+    // and the WSP (wsp_q); pe_fetch drives each lane's bank read port.
+    logic [NUM_MULTS-1:0]                   rd_en;
+    logic [NUM_MULTS-1:0][SLOT_WIDTH-1:0]   rd_slot;
+    logic [NUM_MULTS-1:0][DATA_WIDTH-1:0]   rd_val;
+    logic [NUM_MULTS-1:0][PID_WIDTH-1:0]    rd_pid;
     logic [NUM_MULTS-1:0][NUM_PID-1:0]      wsp_q;
 
-    // Per-lane MAC controls from the window's action-eval (KEEP/UPDATE -> MAC).
+    // Per-lane MAC controls from pe_fetch's action-eval (KEEP/BANK -> MAC).
     logic [NUM_MULTS-1:0]                   mac_en;
     logic [NUM_MULTS-1:0][DATA_WIDTH-1:0]   mac_w;
 
@@ -153,9 +124,9 @@ module pe #(
     // -------------------------------------------------------------------------
     // Submodules
     // -------------------------------------------------------------------------
-    pe_wmem #(
+    pe_mem #(
         .NUM_MULTS(NUM_MULTS), .NUM_PID(NUM_PID), .DATA_WIDTH(DATA_WIDTH)
-    ) u_wmem (
+    ) u_mem (
         .clk        (clk),
         .rst_n      (rst_n),
         .wfill_we   (wfill_we),
@@ -164,21 +135,20 @@ module pe #(
         .wfill_val  (wfill_val),
         .wload_done (wload_done),
         .rd_en      (rd_en),
-        .rd_addr    (rd_addr),
+        .rd_slot    (rd_slot),
         .rd_val     (rd_val),
         .rd_pid     (rd_pid),
-        .wfill_cnt  (wfill_cnt),
         .wsp_q      (wsp_q)
     );
 
-    // The window owns the Curr/Next weight state AND the per-lane action-eval,
-    // so it is self-contained about why it stalls; it exports only the MAC
-    // controls (mac_en/mac_w) the datapath below needs.
-    pe_window #(
-        .NUM_MULTS(NUM_MULTS), 
-        .NUM_PID(NUM_PID), 
+    // pe_fetch owns the per-lane held weight AND the action-eval, so it is
+    // self-contained about why it stalls; it exports only the MAC controls
+    // (mac_en/mac_w) the datapath below needs.
+    pe_fetch #(
+        .NUM_MULTS(NUM_MULTS),
+        .NUM_PID(NUM_PID),
         .DATA_WIDTH(DATA_WIDTH)
-    ) u_window (
+    ) u_fetch (
         .clk            (clk),
         .rst_n          (rst_n),
         .wload_done     (wload_done),
@@ -186,11 +156,10 @@ module pe #(
         .b_pid          (b_pid),
         .b_ready        (b_ready),
         .wsp_q          (wsp_q),
-        .wfill_cnt      (wfill_cnt),
         .rd_val         (rd_val),
         .rd_pid         (rd_pid),
         .rd_en          (rd_en),
-        .rd_addr        (rd_addr),
+        .rd_slot        (rd_slot),
         .mac_en         (mac_en),
         .mac_w          (mac_w)
     );

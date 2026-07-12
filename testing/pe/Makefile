@@ -44,7 +44,7 @@ NUM_CID := $(shell echo $$(( $(E) * $(E) )))
 export H F S NUM_PE NUM_MULTS WAVES
 
 COMMON_RTL := $(RTL)/common/sram.sv $(RTL)/pe/pe_lane.sv \
-              $(RTL)/pe/pe_wmem.sv $(RTL)/pe/pe_window.sv $(RTL)/pe/pe.sv
+              $(RTL)/pe/pe_mem.sv $(RTL)/pe/pe_fetch.sv $(RTL)/pe/pe.sv
 
 ifeq ($(DUT),array)
     MODULE          := test_pe_array

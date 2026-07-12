@@ -120,13 +120,12 @@ async def load_weights(dut, sw):
         await RisingEdge(dut.clk)
     dut.wfill_we.value = 0
 
-    # 2) arm: pulse wload_done; the PE pre-loads every lane's Curr/Next.
+    # 2) arm: pulse wload_done. The PE arms the next cycle with an empty window
+    # (no warm sequence); each lane's first hit fetches its weight on demand.
     dut.wload_done.value = 1
     await RisingEdge(dut.clk)
     dut.wload_done.value = 0
-    # Warm-up: 2*NUM_MULTS+1 cycles to seed every lane's Curr+Next from SRAM.
-    for _ in range(2 * NUM_MULTS + 2):
-        await RisingEdge(dut.clk)
+    await RisingEdge(dut.clk)
 
 
 async def stream_fifo_b(dut, fifo_b):
@@ -216,54 +215,33 @@ def _safe_int(sig):
 class PerfCounters:
     """Cycle counters for one PE run. All counts are in clk cycles."""
     __slots__ = ("cycles", "offered", "consumed", "stalled",
-                 "stall_inflight", "stall_skip", "macs",
-                 "load_cycles", "drain_cycles")
+                 "stall_fetch", "macs", "load_cycles", "drain_cycles")
 
     def __init__(self):
         self.cycles = 0          # every sampled cycle the monitor is alive
         self.offered = 0         # b_valid==1 (PE was presented an activation)
         self.consumed = 0        # b_valid && b_ready (activation admitted)
         self.stalled = 0         # b_valid && !b_ready (bubble)
-        self.stall_inflight = 0  # of the stalls, blocking lane awaits SRAM data
-        self.stall_skip = 0      # of the stalls, lane slides multiple positions
+        self.stall_fetch = 0     # of the stalls, a lane was awaiting a weight fetch
         self.macs = 0            # sum of per-lane useful MACs (popcount mac_en_q)
-        self.load_cycles = 0     # fixed overhead: weight-load + warm-up
+        self.load_cycles = 0     # fixed overhead: weight-load + arm
         self.drain_cycles = 0    # fixed overhead: accumulator drain-out
 
     # --- derived metrics ---------------------------------------------------
     @property
     def stall_other(self):
-        """Stalled cycles that couldn't be attributed to a cause -- must be 0
-        if any_skip/any_in_flight are readable (b_ready = !skip && !in_flight)."""
-        return self.stalled - self.stall_inflight - self.stall_skip
-
-    @property
-    def throughput(self):
-        """Admitted activations per offered cycle (1.0 == no stalls)."""
-        return self.consumed / self.offered if self.offered else 0.0
+        """Stalled cycles not attributed to a lane fetch -- must be 0 if
+        need_fetch is readable (b_ready = !need_fetch)."""
+        return self.stalled - self.stall_fetch
 
     @property
     def overall_lane_util(self):
-        """Useful MACs / (compute-window cycles x NUM_MULTS): fraction of
-        multiplier-slots doing useful work, counting reload-stall bubbles as
-        idle (a stalled cycle is a cycle the multipliers produced nothing).
-        Matches perf_pe.PEStats.overall_lane_util.
-        Decomposes as overall = compute_lane_util * (1 - stall_frac)."""
+        """Useful MACs / (offered x NUM_MULTS): fraction of multiplier-slots
+        doing useful work, counting fetch-stall bubbles as idle (a stalled
+        cycle is a cycle the multipliers produced nothing). offered is every
+        clk in the streaming phase (excludes weight-load and drain)."""
         d = self.offered * NUM_MULTS
         return self.macs / d if d else 0.0
-
-    @property
-    def compute_lane_util(self):
-        """Useful MACs / (admitted acts x NUM_MULTS): union-gating efficiency
-        alone -- how many lanes fire per admitted activation, stall bubbles
-        excluded. Matches perf_pe.PEStats.compute_lane_util."""
-        d = self.consumed * NUM_MULTS
-        return self.macs / d if d else 0.0
-
-    @property
-    def stall_frac(self):
-        """Fraction of compute-window cycles lost to reload stalls."""
-        return self.stalled / self.offered if self.offered else 0.0
 
 
 async def _mac_cycle_monitor(dut, perf, stop):
@@ -282,25 +260,19 @@ async def _mac_cycle_monitor(dut, perf, stop):
             perf.macs += _popcount(me)
 
 
-async def stream_fifo_b_perf(dut, fifo_b, perf, sig_skip_lanes, sig_infl_lanes):
+async def stream_fifo_b_perf(dut, fifo_b, perf, sig_need_fetch):
     """stream_fifo_b + per-cycle handshake accounting (offered/consumed/stalled
     + stall cause).
 
-    The PE stalls while any lane can't accept the beat: b_ready is low on
-    any_skip (a wsp-hit lane must SLIDE) OR any_in_flight (a lane's refill is
-    still landing). Cause split, latched on the FIRST stalled cycle of each
-    episode and booked to every cycle of it:
-      inflight -- a blocking lane's refill is mid-flight: the 1-cycle SRAM
-                  read latency is exposed (nothing to arbitrate, just wait).
-      skip     -- a blocking lane must slide through >1 weight positions
-                  (sparse-activation PID jumps) or is queued behind the
-                  single-read-port arbiter."""
+    The PE has a single stall cause: b_ready is low iff some wsp-hit lane still
+    needs to fetch its weight (need_fetch). That signal is asserted on every
+    stalled cycle, so a per-cycle check attributes them all -- stall_other must
+    end at 0 (verified in run_case_perf)."""
     for (axy, cid, pid) in fifo_b:
         dut.b_valid.value = 1
         dut.b_act.value   = _mask(axy, DATA_WIDTH)
         dut.b_pid.value   = pid
         dut.b_cid.value   = cid
-        stall_cause = None
         while True:
             await RisingEdge(dut.clk)
             perf.offered += 1
@@ -308,27 +280,14 @@ async def stream_fifo_b_perf(dut, fifo_b, perf, sig_skip_lanes, sig_infl_lanes):
                 perf.consumed += 1
                 break
             perf.stalled += 1
-            if stall_cause is None:
-                skip_v = _safe_int(sig_skip_lanes) or 0
-                infl_v = _safe_int(sig_infl_lanes) or 0
-                # b_ready = !any_skip && !any_in_flight -> a refill in flight
-                # stalls the PE even when no lane wants a SLIDE, so inflight
-                # must be attributed independently of skip (else it leaks into
-                # stall_other and trips the assert in run_case_perf).
-                if infl_v:
-                    stall_cause = "inflight"
-                elif skip_v:
-                    stall_cause = "skip"
-            if stall_cause == "skip":
-                perf.stall_skip += 1
-            elif stall_cause == "inflight":
-                perf.stall_inflight += 1
+            if _safe_int(sig_need_fetch):
+                perf.stall_fetch += 1
         dut.b_valid.value = 0
     dut.b_valid.value = 0
 
 
-async def run_case_perf(dut, act, kernels, name, sig_skip_lanes, sig_infl_lanes):
-    """Drive NUM_MULTS real kernels into one V2 PE, measure the compute window,
+async def run_case_perf(dut, act, kernels, name, sig_need_fetch):
+    """Drive NUM_MULTS real kernels into one V2 PE, measure the streaming phase,
     and verify every lane against dense conv. Returns (PerfCounters, n_acts)."""
     fifo_b, per_lane_sw, per_lane_wsp = route_v2_one_pe(act, kernels)
     goldens = [fm.conv2d_reference(act, k, S) for k in kernels]
@@ -336,7 +295,7 @@ async def run_case_perf(dut, act, kernels, name, sig_skip_lanes, sig_infl_lanes)
     await reset(dut)
 
     # Start the monitor before the weight load so perf.cycles captures the
-    # fixed load+warm-up overhead too (no MACs fire outside S_RUN, so this does
+    # fixed load+arm overhead too (no MACs fire before running, so this does
     # not perturb the MAC count).
     perf = PerfCounters()
     stop = Event()
@@ -345,7 +304,7 @@ async def run_case_perf(dut, act, kernels, name, sig_skip_lanes, sig_infl_lanes)
     await load_weights_multi(dut, per_lane_sw, per_lane_wsp)
     perf.load_cycles = perf.cycles
 
-    await stream_fifo_b_perf(dut, fifo_b, perf, sig_skip_lanes, sig_infl_lanes)
+    await stream_fifo_b_perf(dut, fifo_b, perf, sig_need_fetch)
 
     c_pre_drain = perf.cycles
     got = await drain_all_lanes(dut)
@@ -355,7 +314,7 @@ async def run_case_perf(dut, act, kernels, name, sig_skip_lanes, sig_infl_lanes)
 
     assert perf.stall_other == 0, (
         f"[{name}] {perf.stall_other} stalled cycles unattributed "
-        f"(want_skip_only/refill_in_flight unreadable?)")
+        f"(need_fetch probe unreadable?)")
 
     for k, golden in enumerate(goldens):
         out = [[got[k].get(r * E + c, 0) for c in range(E)] for r in range(E)]
@@ -389,22 +348,33 @@ async def test_perf(dut):
     cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
     rng = random.Random(0xBEEF)
 
-    # Resolve the internal per-lane stall-cause probes once (None if absent ->
-    # the stall_other assert in run_case_perf catches an unusable probe). Both
-    # live inside the window submodule (u_window), so reach them hierarchically.
-    win = getattr(dut, "u_window", None)
-    sig_skip_lanes = getattr(win, "want_skip_only", None)
-    sig_infl_lanes = getattr(win, "refill_in_flight", None)
+    # Resolve the internal stall-cause probe once (None if absent -> the
+    # stall_other assert in run_case_perf catches an unusable probe). It lives
+    # inside the fetch submodule (u_fetch), reached hierarchically.
+    fetch = getattr(dut, "u_fetch", None)
+    sig_need_fetch = getattr(fetch, "need_fetch", None)
 
     # (name, activation density, weight density). Names read actXX_wgtYY =
     # XX% activation density, YY% weight density.
-    # Note: b_ready stalls only on lanes that can't MAC the current beat, so
-    # a same-PID run of >= NUM_MULTS beats hides the single-ported weight SRAM's
-    # refill serialization; "roofline" should sustain thru ~1.0. Stalls appear
-    # when PID run lengths drop below NUM_MULTS (sparse activations).
+    # Note: b_ready stalls only on lanes that can't MAC the current beat, so a
+    # same-PID run hides the fetch latency; "roofline" sustains ~1.0. Stalls
+    # appear when a lane must jump to a new weight (sparse-activation PID jumps).
     grid = [
         # dense reference
         ("roofline",     1.0, 1.0),   # both dense: peak / roofline baseline
+
+        # equal-density diagonal sweep: 90/90 down to 10/10, descending from roofline
+        ("act90_wgt90",  0.9, 0.9),
+        ("act80_wgt80",  0.8, 0.8),
+        ("act70_wgt70",  0.7, 0.7),
+        ("act60_wgt60",  0.6, 0.6),
+        ("act50_wgt50d", 0.5, 0.5),
+        ("act40_wgt40",  0.4, 0.4),
+        ("act30_wgt30d", 0.3, 0.3),
+        ("act20_wgt20",  0.2, 0.2),
+        ("act10_wgt10",  0.1, 0.1),
+
+        None,   # blank-line separator: diagonal sweep above, original cases below
 
         # weight sweep @ dense activation: isolates union-gating (no act stalls)
         ("act100_wgt70", 1.0, 0.7),
@@ -434,7 +404,11 @@ async def test_perf(dut):
     def _fill_nonzero(mat):
         return [[(v if v != 0 else 1) for v in row] for row in mat]
 
-    for (nm, da, dw) in grid:
+    for entry in grid:
+        if entry is None:
+            rows.append(None)                    # section break -> blank line
+            continue
+        (nm, da, dw) = entry
         act = rand_matrix(H, H, da, rng)
         if da >= 1.0:
             act = _fill_nonzero(act)
@@ -447,8 +421,7 @@ async def test_perf(dut):
             if all(v == 0 for r in ker for v in r):
                 ker[0][0] = 3
             kernels.append(ker)
-        perf, nacts = await run_case_perf(dut, act, kernels, nm,
-                                          sig_skip_lanes, sig_infl_lanes)
+        perf, nacts = await run_case_perf(dut, act, kernels, nm, sig_need_fetch)
         rows.append((nm, perf, nacts))
 
     # Clock-derived absolute rate: MAC/s = mac_per_cycle * f_clk. FCLK_MHZ
@@ -459,21 +432,20 @@ async def test_perf(dut):
     else:
         f_clk_hz  = 1e9 / CLK_NS
         f_clk_src = "simulated"
-    # Cycles = the sparsity-aware compute window (admitted acts + reload stalls);
+    # Cycles = offered, the sparsity-aware streaming phase (admitted acts + reload stalls);
     # matches perf_pe.PEStats.pe_cycles. The dense baseline is the roofline case
     # (dense act + dense wgt, same H/F/S); speedup = how much sparsity shortens
     # that window. Weight-load + drain are fixed overhead (amortized per layer),
     # reported separately, not folded into the speedup.
-    dense_cycles = next((p.offered for (nm, p, _n) in rows if nm == "roofline"), 0)
+    dense_cycles = next((r[1].offered for r in rows if r and r[0] == "roofline"), 0)
     peak_gops = NUM_MULTS * 2 * f_clk_hz / 1e9
 
-    # GOP/s over the compute window (1 MAC = 2 ops); peak is NUM_MULTS*2*f_clk.
+    # GOP/s over the offered (streaming) cycles (1 MAC = 2 ops); peak is NUM_MULTS*2*f_clk.
     def _gops(p):
         return p.macs * 2 * f_clk_hz / 1e9 / p.offered if p.offered else 0.0
 
     hdr = (f"{'case':<12} {'minCyc':>8} {'computeCyc':>10} {'latency':>8} "
-           f"{'speedup':>8} {'GOPS/s':>8} {'multUtil%':>10} {'gateUtil%':>10} "
-           f"{'stall%':>7}")
+           f"{'speedup':>8} {'GOPS/s':>8} {'multUtil%':>10}")
     lines = [
         "PE PERF  H=%d F=%d S=%d NUM_MULTS=%d  f_clk=%.0f MHz (%s)  "
         "dense=%d cyc  peak=%.3f GOPS/s"
@@ -481,26 +453,24 @@ async def test_perf(dut):
         hdr,
         "-" * len(hdr),
     ]
-    for (nm, p, nacts) in rows:
+    for row in rows:
+        if row is None:
+            lines.append("")                     # separator between case groups
+            continue
+        (nm, p, nacts) = row
         speedup = dense_cycles / p.offered if p.offered else 0.0
         lines.append(f"{nm:<12} {p.consumed:>8} {p.offered:>10} {p.cycles:>8} "
                      f"{speedup:>8.2f} {_gops(p):>8.3f} "
-                     f"{p.overall_lane_util * 100:>10.1f} "
-                     f"{p.compute_lane_util * 100:>10.1f} "
-                     f"{p.stall_frac * 100:>7.1f}")
+                     f"{p.overall_lane_util * 100:>10.1f}")
     lines.append("-" * len(hdr))
     lines += [
         "legend:",
-        "  minCyc     = admitted acts, one/cycle, no stalls: theoretical min",
-        "  computeCyc = actual compute window: minCyc + reload stalls",
+        "  minCyc     = theoretical min num of cycles. 1 activation/cycle with no stalls ",
+        "  computeCyc = actual cycles it takes to process input -> minCyc + reload stalls",
         "  latency    = end-to-end: computeCyc + weight-load + warm-up + drain",
-        "  speedup    = dense computeCyc / case computeCyc (actual)",
-        "  GOPS/s     = compute-window rate, 1 MAC = 2 ops",
-        "  multUtil%  = useful MACs / (computeCyc x NUM_MULTS),"
-        " stalls counted as idle",
-        "  gateUtil%  = union-gating efficiency: lanes firing per admitted act",
-        "  stall%     = computeCyc lost to reload stalls",
-        "  identity   : multUtil = gateUtil x (100% - stall%)",
+        "  speedup    = baseline computeCyc / computeCyc of particular case",
+        "  GOPS/s     = rate over offered cycles, 1 MAC = 2 ops",
+        "  multUtil%  = MACs / (computeCyc x NUM_MULTS)",
     ]
 
     report_path = os.path.join(os.path.dirname(__file__), "pe_perf.txt")
@@ -579,12 +549,12 @@ async def load_weights_multi(dut, per_lane_sw, per_lane_wsp=None):
             await RisingEdge(dut.clk)
     dut.wfill_we.value = 0
 
-    # 2) arm.
+    # 2) arm. The PE arms the next cycle with an empty window (no warm sequence);
+    # each lane's first hit fetches its weight on demand.
     dut.wload_done.value = 1
     await RisingEdge(dut.clk)
     dut.wload_done.value = 0
-    for _ in range(2 * NUM_MULTS + 2):
-        await RisingEdge(dut.clk)
+    await RisingEdge(dut.clk)
 
 
 async def drain_all_lanes(dut, timeout=20000):
