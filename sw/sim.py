@@ -163,21 +163,34 @@ def print_report(net, layers, cfg):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
     sys.path.insert(0, os.path.dirname(__file__))
-    from workloads.alexnet import LAYERS
 
-    no_baseline = "--no-baseline" in sys.argv
+    parser = argparse.ArgumentParser(description="goSPA network-level performance model")
+    parser.add_argument("--net", default="alexnet",
+                        choices=["alexnet", "mobilenetv2"],
+                        help="workload to simulate (default: alexnet)")
+    parser.add_argument("--no-baseline", action="store_true",
+                        help="skip dense comparison run")
+    args = parser.parse_args()
+
+    if args.net == "alexnet":
+        from workloads.alexnet import LAYERS
+        net_label = "AlexNet"
+    else:
+        from workloads.mobilenetv2 import LAYERS
+        net_label = "MobileNetV2"
 
     cfg = HwConfig()   # defaults: N_PE=8, M=4, FREQ_HZ=1e9
 
-    print(f"goSPA perf model -- AlexNet")
+    print(f"goSPA perf model -- {net_label}")
     print(f"  HW : N_PE={cfg.N_PE}  M={cfg.M}  FREQ={cfg.FREQ_HZ/1e9:.1f} GHz")
     print(f"  Sparsity : d_a={LAYERS[0].d_a}  d_w={LAYERS[0].d_w}  (synthetic phase-1)")
-    print(f"  Baseline : {'disabled' if no_baseline else 'enabled (doubles runtime)'}")
+    print(f"  Baseline : {'disabled' if args.no_baseline else 'enabled (doubles runtime)'}")
     print(f"  Layers   : {len(LAYERS)}")
     print()
 
-    net = run_network(LAYERS, cfg, seed=0, baseline=not no_baseline)
+    net = run_network(LAYERS, cfg, seed=0, baseline=not args.no_baseline)
 
     print()
     print_report(net, LAYERS, cfg)
