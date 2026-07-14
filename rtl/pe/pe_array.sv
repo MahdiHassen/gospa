@@ -1,114 +1,95 @@
 // =============================================================================
-// pe_array.sv -- GoSPA PE Array (V2: N_PE PEs, each with N_MULTS lanes)
+// pe_array.sv -- GoSPA PE Array (V2: NUM_PE PEs, each with NUM_MULTS lanes)
 // =============================================================================
 // GoSPA Project -- Team 19, ECE 720 (Spring 2026)
 //
-// N_PE PEs, each holding N_MULTS output channels (V2). Total output
-// channels = N_PE * N_MULTS. Each PE is wired directly onto its FIFO-B
+// NUM_PE PEs, each holding NUM_MULTS output channels (V2). Total output
+// channels = NUM_PE * NUM_MULTS. Each PE is wired directly onto its FIFO-B
 // read port from apu_stage2.
 //
 //   apu.fifob_rd_valid/data/ready[k]  <->  pe[k]   (per-PE lanes
-//                                                   k.0 .. k.{N_MULTS-1})
+//                                                   k.0 .. k.{NUM_MULTS-1})
 //
 // Weight loading (V2)
-//   - Weight SRAM fill is addressed by {wfill_pe, wfill_lane, wfill_slot};
-//     each cycle writes one {wfill_pid, wfill_val} into PE wfill_pe's
-//     internal SRAM at the addressed lane/slot.
-//   - Per-(PE,lane) WSP register file: write via {wsp_pe, wsp_lane, wsp_data}.
-//   - Per-(PE,lane) weight count: drive {wload_count[pe][lane]} and pulse
-//     wload_done; every PE in the array arms simultaneously.
+//   - Weight SRAM fill is addressed by {wfill_pe, wfill_lane}; each cycle
+//     appends one {wfill_pid, wfill_val} to PE wfill_pe's lane. The PE derives
+//     the SRAM slot, per-lane weight count, and per-lane WSP from this stream.
+//   - Pulse wload_done; every PE in the array arms simultaneously. A bare
+//     wload_done re-arms the same weights (see pe.sv).
 //
-// Drain: pulse drain_start; each PE drains its N_MULTS accumulators in
-// parallel (output bus is N_PE*N_MULTS wide).
+// Drain: pulse drain_start; each PE drains its NUM_MULTS accumulators in
+// parallel (output bus is NUM_PE*NUM_MULTS wide).
 // =============================================================================
 
 `default_nettype none
 
 module pe_array #(
-    parameter int N_PE    = 8,
-    parameter int N_MULTS = 4,
-    parameter int N_PID   = 9,
-    parameter int N_CID   = 36,
-    parameter int DATA_W  = 16,
-    parameter int ACC_W   = 32,
+    parameter int NUM_PE     = 8,
+    parameter int NUM_MULTS  = 4,
+    parameter int NUM_PID    = 9,
+    parameter int NUM_CID    = 36,
+    parameter int DATA_WIDTH = 16,
+    parameter int ACC_WIDTH  = 32,
 
     // -- Derived --------------------------------------------------------------
-    localparam int PID_W      = (N_PID   < 2) ? 1 : $clog2(N_PID),
-    localparam int CID_W      = (N_CID   < 2) ? 1 : $clog2(N_CID),
-    localparam int FIFOB_W    = DATA_W + PID_W + CID_W,
-    localparam int PESEL_W    = (N_PE    < 2) ? 1 : $clog2(N_PE),
-    localparam int LANE_W     = (N_MULTS < 2) ? 1 : $clog2(N_MULTS),
-    localparam int WPTR_W     = $clog2(N_PID + 1)
+    localparam int PID_WIDTH   = (NUM_PID  < 2) ? 1 : $clog2(NUM_PID),
+    localparam int CID_WIDTH   = (NUM_CID    < 2) ? 1 : $clog2(NUM_CID),
+    localparam int FIFOB_WIDTH = DATA_WIDTH + PID_WIDTH + CID_WIDTH,
+    localparam int PESEL_WIDTH = (NUM_PE   < 2) ? 1 : $clog2(NUM_PE),
+    localparam int LANE_WIDTH  = (NUM_MULTS < 2) ? 1 : $clog2(NUM_MULTS)
 )(
-    input  wire  logic                                  clk,
-    input  wire  logic                                  rst_n,
+    input  logic                                          clk,
+    input  logic                                          rst_n,
 
-    // -- Weight SRAM fill (PE + lane + slot addressed) ----------------------
-    input  wire  logic                                  wfill_we,
-    input  wire  logic [PESEL_W-1:0]                    wfill_pe,
-    input  wire  logic [LANE_W-1:0]                     wfill_lane,
-    input  wire  logic [WPTR_W-1:0]                     wfill_slot,
-    input  wire  logic [PID_W-1:0]                      wfill_pid,
-    input  wire  logic signed [DATA_W-1:0]              wfill_val,
+    // -- Weight SRAM fill (PE + lane addressed; slot/count/WSP derived) ------
+    input  logic                                          wfill_we,
+    input  logic [PESEL_WIDTH-1:0]                        wfill_pe,
+    input  logic [LANE_WIDTH-1:0]                         wfill_lane,
+    input  logic [PID_WIDTH-1:0]                          wfill_pid,
+    input  logic signed [DATA_WIDTH-1:0]                  wfill_val,
 
-    // -- Per-(PE,lane) WSP write ---------------------------------------------
-    input  wire  logic                                  wsp_we,
-    input  wire  logic [PESEL_W-1:0]                    wsp_pe,
-    input  wire  logic [LANE_W-1:0]                     wsp_lane,
-    input  wire  logic [N_PID-1:0]                      wsp_data,
-
-    // -- Per-(PE,lane) weight count, latched on `wload_done` -----------------
-    input  wire  logic [N_PE-1:0][N_MULTS-1:0][WPTR_W-1:0] wload_count,
-    input  wire  logic                                     wload_done,
+    // -- Arm (every PE arms simultaneously) ----------------------------------
+    input  logic                                          wload_done,
 
     // -- FIFO-B input streams (one per PE; matches apu.fifob_rd_*) ------------
-    input  wire  logic [N_PE-1:0]                       fifob_valid,
-    input  wire  logic [N_PE-1:0][FIFOB_W-1:0]          fifob_data,
-    output logic [N_PE-1:0]                              fifob_ready,
+    input  logic [NUM_PE-1:0]                               fifob_valid,
+    input  logic [NUM_PE-1:0][FIFOB_WIDTH-1:0]              fifob_data,
+    output logic [NUM_PE-1:0]                               fifob_ready,
 
     // -- Drain / per-(PE,lane) output streams --------------------------------
-    input  wire  logic                                  drain_start,
-    output logic                                        drain_busy,
-    output logic                                        drain_done,
-    output logic [N_PE-1:0][N_MULTS-1:0]                 out_valid,
-    output logic [N_PE-1:0][N_MULTS-1:0][CID_W-1:0]      out_cid,
-    output logic [N_PE-1:0][N_MULTS-1:0][ACC_W-1:0]      out_acc,
-    input  wire  logic [N_PE-1:0][N_MULTS-1:0]          out_ready
+    input  logic                                          drain_start,
+    output logic                                          drain_busy,
+    output logic                                          drain_done,
+    output logic [NUM_PE-1:0][NUM_MULTS-1:0]                out_valid,
+    output logic [NUM_PE-1:0][NUM_MULTS-1:0][CID_WIDTH-1:0] out_cid,
+    output logic [NUM_PE-1:0][NUM_MULTS-1:0][ACC_WIDTH-1:0] out_acc,
+    input  logic [NUM_PE-1:0][NUM_MULTS-1:0]                out_ready
 );
 
-    logic [N_PE-1:0] pe_busy;
+    logic [NUM_PE-1:0] pe_busy;
 
     genvar p;
     /* verilator lint_off PINCONNECTEMPTY */
     generate
-        for (p = 0; p < N_PE; p++) begin : g_pe
+        for (p = 0; p < NUM_PE; p++) begin : g_pe
             // Unpack this PE's FIFO-B payload: {act, pid, cid}.
-            logic signed [DATA_W-1:0] p_act;
-            logic [PID_W-1:0]         p_pid;
-            logic [CID_W-1:0]         p_cid;
-            assign p_act = fifob_data[p][FIFOB_W-1 -: DATA_W];
-            assign p_pid = fifob_data[p][CID_W +: PID_W];
-            assign p_cid = fifob_data[p][CID_W-1:0];
+            logic signed [DATA_WIDTH-1:0] p_act;
+            logic [PID_WIDTH-1:0]         p_pid;
+            logic [CID_WIDTH-1:0]         p_cid;
 
             pe #(
-                .N_MULTS(N_MULTS), .N_PID(N_PID), .N_CID(N_CID),
-                .DATA_W(DATA_W), .ACC_W(ACC_W)
+                .NUM_MULTS(NUM_MULTS), .NUM_PID(NUM_PID), .NUM_CID(NUM_CID),
+                .DATA_WIDTH(DATA_WIDTH), .ACC_WIDTH(ACC_WIDTH)
             ) u_pe (
                 .clk        (clk),
                 .rst_n      (rst_n),
                 // Weight SRAM fill, gated per PE; arm broadcast to all.
-                .wfill_we   (wfill_we && (wfill_pe == PESEL_W'(p))),
+                .wfill_we   (wfill_we && (wfill_pe == PESEL_WIDTH'(p))),
                 .wfill_lane (wfill_lane),
-                .wfill_slot (wfill_slot),
                 .wfill_pid  (wfill_pid),
                 .wfill_val  (wfill_val),
-                // WSP write, gated per PE.
-                .wsp_we     (wsp_we && (wsp_pe == PESEL_W'(p))),
-                .wsp_lane   (wsp_lane),
-                .wsp_data   (wsp_data),
                 // Arm.
                 .wload_done (wload_done),
-                .wload_count(wload_count[p]),
                 // FIFO-B stream.
                 .b_valid    (fifob_valid[p]),
                 .b_act      (p_act),
@@ -124,18 +105,26 @@ module pe_array #(
                 .out_cid    (out_cid[p]),
                 .out_acc    (out_acc[p])
             );
+
+            assign p_act = fifob_data[p][FIFOB_WIDTH-1 -: DATA_WIDTH];
+            assign p_pid = fifob_data[p][CID_WIDTH +: PID_WIDTH];
+            assign p_cid = fifob_data[p][CID_WIDTH-1:0];
         end
     endgenerate
     /* verilator lint_on PINCONNECTEMPTY */
 
     // Array-level drain status (any PE busy / falling edge done).
-    assign drain_busy = |pe_busy;
+
     logic busy_q;
     always_ff @(posedge clk) begin
-        if (!rst_n) busy_q <= 1'b0;
-        else        busy_q <= drain_busy;
+        if (!rst_n) 
+            busy_q <= 1'b0;
+        else        
+            busy_q <= drain_busy;
     end
+
     assign drain_done = busy_q && !drain_busy;
+    assign drain_busy = |pe_busy;
 
 endmodule
 

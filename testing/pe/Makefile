@@ -3,92 +3,107 @@
 # ==============================================================================
 # GoSPA Project -- Team 19, ECE 720 (Spring 2026)
 #
-# Usage:
-#   make MODULE=test_pe                 # default H=8 F=3 S=1 (Icarus)
-#   make MODULE=test_pe H=8 F=3 S=2     # different layer
-#   make sweep_pe                       # several layer configs
-#   make MODULE=test_pe SIM=verilator   # (build dir must be exec-friendly)
-#   make clean
+# Targets (each does a fresh build -- the previous sim_build is auto-removed):
+#   make pe            # single PE   (test_pe.py)
+#   make array         # PE array    (test_pe_array.py)
+#   make sweep_pe      # single PE across several layer configs
+#   make sweep_array   # PE array across several (layer, NUM_PE) configs
+#   make clean         # remove build artifacts
+#
+# Knobs (override on the command line), with defaults:
+#   SIM=verilator   simulator: verilator | icarus
+#   H=8 F=3 S=1     layer geometry (input HxH, kernel FxF, stride S)
+#   NUM_PE=8          PEs in the array (array target only)
+#   NUM_MULTS=4       multiplier lanes per PE (matches the synthesized config)
+#   WAVES=1         dump a waveform (default 0): ./dump.vcd (verilator) or
+#                   ./dump.fst (icarus), written in this directory
+#
+#   e.g.  make array SIM=icarus H=8 F=3 S=2 NUM_PE=8
+#         make pe WAVES=1              # then open ./dump.vcd
+#
+# Post-synthesis gate-level sim lives in testing/synthesis/Makefile.
 # ==============================================================================
 
-SIM      ?= verilator
-TOPLEVEL_LANG ?= verilog
+SIM       ?= verilator
+
+H         ?= 8
+F         ?= 3
+S         ?= 1
+NUM_PE    ?= 8
+NUM_MULTS ?= 4
+WAVES     ?= 0
+
 
 REPO_ROOT := $(realpath ../..)
-PE_DIR    := $(REPO_ROOT)/rtl/pe
+RTL       := $(REPO_ROOT)/rtl
 
-# -- Layer config (override on command line) ----------------------------------
-H       ?= 8
-F       ?= 3
-S       ?= 1
-N_PE    ?= 4
-N_MULTS ?= 1
+E     := $(shell echo $$(( ($(H) - $(F)) / $(S) + 1 )))
+NUM_PID := $(shell echo $$(( $(F) * $(F) )))
+NUM_CID := $(shell echo $$(( $(E) * $(E) )))
 
-# Derived sizes the PE is parameterized by (kernel positions, output positions).
-N_PID := $(shell echo $$(( $(F) * $(F) )))
-EE    := $(shell echo $$(( ($(H) - $(F)) / $(S) + 1 )))
-N_CID := $(shell echo $$(( $(EE) * $(EE) )))
+export H F S NUM_PE NUM_MULTS WAVES
 
-MODULE ?= test_pe
+COMMON_RTL := $(RTL)/common/sram.sv $(RTL)/pe/pe_lane.sv \
+              $(RTL)/pe/pe_mem.sv $(RTL)/pe/pe_fetch.sv $(RTL)/pe/pe.sv
 
-# Single PE vs PE array: pick top module + sources from MODULE.
-ifeq ($(MODULE),test_pe_array)
-    VERILOG_SOURCES := $(REPO_ROOT)/rtl/common/sram.sv \
-                       $(PE_DIR)/pe_acc.sv $(PE_DIR)/pe.sv $(PE_DIR)/pe_array.sv
+ifeq ($(DUT),array)
+    MODULE          := test_pe_array
     TOPLEVEL        := pe_array
-    PARAMS_ICARUS   := -Ppe_array.N_PID=$(N_PID) -Ppe_array.N_CID=$(N_CID) \
-                       -Ppe_array.N_PE=$(N_PE) -Ppe_array.N_MULTS=$(N_MULTS)
-    PARAMS_VERILATOR:= -GN_PID=$(N_PID) -GN_CID=$(N_CID) \
-                       -GN_PE=$(N_PE) -GN_MULTS=$(N_MULTS)
+    VERILOG_SOURCES := $(COMMON_RTL) $(RTL)/pe/pe_array.sv
+    PARAMS          := NUM_PID=$(NUM_PID) NUM_CID=$(NUM_CID) NUM_MULTS=$(NUM_MULTS) NUM_PE=$(NUM_PE)
 else
-    VERILOG_SOURCES := $(REPO_ROOT)/rtl/common/sram.sv \
-                       $(PE_DIR)/pe_acc.sv $(PE_DIR)/pe.sv
+    MODULE          := test_pe
     TOPLEVEL        := pe
-    PARAMS_ICARUS   := -Ppe.N_PID=$(N_PID) -Ppe.N_CID=$(N_CID) -Ppe.N_MULTS=$(N_MULTS)
-    PARAMS_VERILATOR:= -GN_PID=$(N_PID) -GN_CID=$(N_CID) -GN_MULTS=$(N_MULTS)
+    VERILOG_SOURCES := $(COMMON_RTL)
+    PARAMS          := NUM_PID=$(NUM_PID) NUM_CID=$(NUM_CID) NUM_MULTS=$(NUM_MULTS)
 endif
 
+# Compiler Conditional
 ifeq ($(SIM),icarus)
-    COMPILE_ARGS += -g2012 $(PARAMS_ICARUS)
-endif
-ifeq ($(SIM),verilator)
-    COMPILE_ARGS += $(PARAMS_VERILATOR)
-    EXTRA_ARGS   += --timing -Wall --Wno-UNOPTFLAT --Wno-WIDTH --Wno-TIMESCALEMOD \
-                    --Wno-DECLFILENAME --Wno-UNUSEDSIGNAL --Wno-EOFNEWLINE
+    COMPILE_ARGS += -g2012 $(foreach p,$(PARAMS),-P$(TOPLEVEL).$(p))
+else ifeq ($(SIM),verilator)
+    COMPILE_ARGS += $(foreach p,$(PARAMS),-G$(p))
+    EXTRA_ARGS   += --timing -Wall --Wno-UNOPTFLAT --Wno-WIDTH \
+                    --Wno-TIMESCALEMOD --Wno-DECLFILENAME \
+                    --Wno-UNUSEDSIGNAL --Wno-EOFNEWLINE
+    ifeq ($(WAVES),1)
+        VERILATOR_TRACE := 1
+    endif
+else
+    $(error Unknown SIM='$(SIM)' -- use SIM=verilator or SIM=icarus)
 endif
 
-# make config visible to the testbench
-export H
-export F
-export S
-export N_PE
-export N_MULTS
-
+# Default cocotb include
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
-.PHONY: sweep_pe sweep_array clean_all
-clean_all: clean
-	rm -rf __pycache__ *.xml results.xml
+.PHONY: pe array sweep_pe sweep_array
+
+# $(1) = friendly name, $(2) = DUT value passed to the include block above
+define run_dut
+	@echo "=================================================="
+	@echo "  $(1)  |  SIM=$(SIM)  H=$(H) F=$(F) S=$(S) NUM_PE=$(NUM_PE) NUM_MULTS=$(NUM_MULTS)  WAVES=$(WAVES)"
+	@echo "  -> NUM_PID=$(NUM_PID) NUM_CID=$(NUM_CID) (E=$(E))"
+	@echo "=================================================="
+	@$(MAKE) -s clean
+	@$(MAKE) DUT=$(2) results.xml
+endef
+
+pe:
+	$(call run_dut,pe,)
+
+array:
+	$(call run_dut,array,array)
 
 sweep_pe:
 	@for cfg in "8 3 1" "8 3 2" "6 3 1" "7 3 2" "8 2 2" "10 5 1" "9 3 2"; do \
 		set -- $$cfg; \
-		echo "=================================================="; \
-		echo "  pe  H=$$1 F=$$2 S=$$3"; \
-		echo "=================================================="; \
-		$(MAKE) -s clean; \
-		$(MAKE) -s MODULE=test_pe H=$$1 F=$$2 S=$$3 || exit 1; \
+		$(MAKE) pe H=$$1 F=$$2 S=$$3 || exit 1; \
 	done
 	@echo "All PE sweep configs passed."
 
-# H F S N_PE per config
 sweep_array:
 	@for cfg in "8 3 1 4" "8 3 1 8" "8 3 2 4" "6 3 1 2" "8 2 2 4" "10 5 1 3"; do \
 		set -- $$cfg; \
-		echo "=================================================="; \
-		echo "  pe_array  H=$$1 F=$$2 S=$$3 N_PE=$$4"; \
-		echo "=================================================="; \
-		$(MAKE) -s clean; \
-		$(MAKE) -s MODULE=test_pe_array H=$$1 F=$$2 S=$$3 N_PE=$$4 || exit 1; \
+		$(MAKE) array H=$$1 F=$$2 S=$$3 NUM_PE=$$4 || exit 1; \
 	done
 	@echo "All PE-array sweep configs passed."

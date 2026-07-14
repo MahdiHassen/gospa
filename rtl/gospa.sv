@@ -194,9 +194,9 @@ module gospa #(
     // PE Array instance
     // -------------------------------------------------------------------------
     pe_array #(
-        .N_PE(N_PE), .N_MULTS(N_MULTS),
-        .N_PID(N_PID), .N_CID(N_CID),
-        .DATA_W(DATA_W), .ACC_W(ACC_W)
+        .NUM_PE(N_PE), .NUM_MULTS(N_MULTS),
+        .NUM_PID(N_PID), .NUM_CID(N_CID),
+        .DATA_WIDTH(DATA_W), .ACC_WIDTH(ACC_W)
     ) u_pe_array (
         .clk         (clk),
         .rst_n       (rst_n),
@@ -204,16 +204,9 @@ module gospa #(
         .wfill_we    (pe_wfill_we),
         .wfill_pe    (pe_wfill_pe),
         .wfill_lane  (pe_wfill_lane),
-        .wfill_slot  (pe_wfill_slot),
         .wfill_pid   (pe_wfill_pid),
         .wfill_val   (pe_wfill_val),
 
-        .wsp_we      (pe_wsp_we),
-        .wsp_pe      (pe_wsp_pe),
-        .wsp_lane    (pe_wsp_lane),
-        .wsp_data    (pe_wsp_data),
-
-        .wload_count (pe_wload_count),
         .wload_done  (pe_wload_done),
 
         .fifob_valid (fifob_valid),
