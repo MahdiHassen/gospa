@@ -172,6 +172,10 @@ if __name__ == "__main__":
                         help="workload to simulate (default: alexnet)")
     parser.add_argument("--no-baseline", action="store_true",
                         help="skip dense comparison run")
+    parser.add_argument("--da", default=0.5,
+                        help="activation density", type=float)
+    parser.add_argument("--dw", default=0.5,
+                        help="weight density", type=float)
     args = parser.parse_args()
 
     if args.net == "alexnet":
@@ -183,14 +187,25 @@ if __name__ == "__main__":
 
     cfg = HwConfig()   # defaults: N_PE=8, M=4, FREQ_HZ=1e9
 
+    new_layers = []
+    if args.da == 0.5 and args.dw == 0.5:
+        new_layers = LAYERS
+    else:
+        for i, layer in enumerate(LAYERS):
+            new_layers.append(replace(layer, d_a=args.da, d_w=args.dw))
+
     print(f"goSPA perf model -- {net_label}")
     print(f"  HW : N_PE={cfg.N_PE}  M={cfg.M}  FREQ={cfg.FREQ_HZ/1e9:.1f} GHz")
-    print(f"  Sparsity : d_a={LAYERS[0].d_a}  d_w={LAYERS[0].d_w}  (synthetic phase-1)")
+    print(f"  Sparsity : d_a={new_layers[0].d_a}  d_w={new_layers[0].d_w}  (synthetic phase-1)")
     print(f"  Baseline : {'disabled' if args.no_baseline else 'enabled (doubles runtime)'}")
-    print(f"  Layers   : {len(LAYERS)}")
+    print(f"  Layers   : {len(new_layers)}")
     print()
 
-    net = run_network(LAYERS, cfg, seed=0, baseline=not args.no_baseline)
+    # new_layers = []
+    # for i, layer in enumerate(LAYERS):
+    #     new_layers.append(replace(layer, d_a=0.3, d_w=1.0))
+
+    net = run_network(new_layers, cfg, seed=0, baseline=not args.no_baseline)
 
     print()
-    print_report(net, LAYERS, cfg)
+    print_report(net, new_layers, cfg)
