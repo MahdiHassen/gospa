@@ -54,6 +54,33 @@ metric gathering toward the final report.
 
 ### 1.3 Mahdi Hassen
 
+Ahead of schedule
+
+Progress:
+- Stitching together RTL for the goSPA module, completing the initial top-level:
+  - updated PE sv to match architecture
+  - Added SRAM to PE and APU
+  - modify APU TB to measure perf metrics
+  - Changed all modules to have synchronous reset
+  - Added pipeline stage in PE
+- Verified compared to functional model on MobileNetV2 Layer 1
+  - Extracted Utilization numbers for MobileNetV2
+  - Added various verification tests including end to end classification of a img (class: granny smith apple)
+- Wrote mini-complier which maps larger input computation to smaller GoSPA module
+
+Chnages to plan: 
+- No longer designing modules for intermediate layers, will be done inside the TB or in SW 
+- Added mini-compiler to map more general computation into GoSPA modules
+
+Next Steps:
+- Evaluate and assist with implementing the new architecture interpretation 
+- Map various CNN architectures and extract perf metrics
+- Work on optimizing architecture
+- Write new mini-compiler to map CNN architectures to physical GoSPA modules
+
+
+
+
 ---
 
 ### 1.4 Sara Ahmad
@@ -63,42 +90,35 @@ metric gathering toward the final report.
 ### 1.5 Adil Kazimov
 
 
-## 2. Weekly milestones — met / delayed / skipped
+## 2. Milestones — met / delayed / skipped
 
 Milestones are taken from the per-member table in `reports/plan.md`. Period covered: June 19 -> July 17.
 
-### Sub-period ending July 5
-
 | Member | Planned task | Status | Notes |
 |---|---|---|---|
 | Fred |  |  |  |
-| Mahdi |  |  |  |
+| Mahdi | Intermediate CNN layers (maxpooling, fully connected) in HW | **Skipped** | No longer designed as dedicated RTL modules — handled in the TB / SW instead (see Section 3); effort redirected to top-level RTL integration |
+| Mahdi | Stitch RTL into the initial GoSPA top-level | **Met / exceeded** | Completed the initial top-level: updated `pe.sv` to match the architecture, added SRAM to the PE and APU, converted all modules to synchronous reset, added a pipeline stage in the PE, and modified the APU TB to measure perf metrics |
+| Mahdi | Verify against the functional model | **Met** | Verified against the functional model on MobileNetV2 Layer 1, extracted MobileNetV2 utilization numbers, and added verification tests including end-to-end classification of an image (class: granny smith apple) |
+| Mahdi | Mini-compiler | **Added** | Wrote a mini-compiler that maps a larger input computation onto the smaller GoSPA module |
 | Sara |  |  |  |
 | Emon | `apu.sv` with router & FIFOs | **Met** | APU top completed within the team; effort redirected to the PE |
-| Adil |  |  |  |
-
-### Sub-period ending July 12
-
-| Member | Planned task | Status | Notes |
-|---|---|---|---|
-| Fred |  |  |  |
-| Mahdi |  |  |  |
-| Sara |  |  |  |
 | Emon | APU full TB | **Met** | Full-APU test completed within the team |
+| Emon | Help finish PE remaining modules | **Met / exceeded**: built the full PE + PE array, a reusable pipelined arithmetic unit integrated into the PE, and the FPGA implementation flow (post-route Fmax ~226 MHz) |  |
 | Adil |  |  |  |
-
-### Sub-period ending July 19 (in progress at time of report)
-
-| Member | Planned task | Status @ Jul 17 |
-|---|---|---|
-| Fred |  |  |
-| Mahdi |  |  |
-| Sara |  |  |
-| Emon | Help finish PE remaining modules | **Met / exceeded** — built the full PE + PE array, a reusable pipelined arithmetic unit integrated into the PE, and the FPGA implementation flow (post-route Fmax ~226 MHz) |
-| Adil |  |  |
 
 
 ## 3. Refinements to the initial plan
+
+The biggest change in the plan is changing out interpretation of the GoSPA architecture. The paper itself is ambiguous on certain aspects of the architecture, specifically how multiple kernels map within a PE. Our interpretation (dubbed V2 interpretation in functional.py) relies on each kernel mapping to one multiplier, and thus multiple kernels per PE. Upon implementing our interpretation in both the performance model and the RTL, we determined that our interpretation of the architecture does not yield the same results from the paper in terms of multiplier utilization.
+
+When evaluating an alternative interpretation in which a PE holds a single kernel, we achieve an increased multiplier utilization value. It's worth noting that this implementation seems to contradict the paper's claim that one activation is fed into a PE per cycle. To keep the PE fed, we must push in multiple activations every cycle. This contradiction was the main reason for the previous interpretation. 
+
+Since the team is very ahead of schedule, we see value in spending time to implement this new interpretation in RTL and comparing it with our previous one.
+
+The downstream plan remains the same: new top level done by July 26, running full workloads by August 2.
+
+Other changes include:
 
 1. **Synthesis pulled forward, FPGA-first.** Rather than starting with the ASIC (OpenLane) flow at the
    Aug 9 milestone, an FPGA implementation (Vivado, Kria KV260) was brought up first -- it stands up
@@ -116,5 +136,4 @@ Milestones are taken from the per-member table in `reports/plan.md`. Period cove
    activations. Recommend aligning the software model to the corrected (skip-handling) dataflow so the
    performance model's sparse-case counts stay accurate.
 
-4. **No change to downstream milestones.** Top-level integration, full-CNN bring-up, and final
-   verification/metrics (July 26 -> Aug 9) remain as planned.
+4. **Mini Compiler.** Add a small component to flexibly map CNN architectures onto GoSPA modules
