@@ -90,7 +90,8 @@ module pe #(
     logic [NUM_MULTS-1:0][CID_WIDTH-1:0]    pe_out_cid_w;
     logic [NUM_MULTS-1:0][ACC_WIDTH-1:0]    pe_out_acc_w;
     logic [NUM_MULTS-1:0]                   pe_drain_busy_w;
-    logic [NUM_MULTS-1:0]                   mac_en_q;
+    logic [NUM_MULTS-1:0]                   mac_en_q;   // per-lane "MAC in flight" (drain gate)
+    logic [NUM_MULTS-1:0]                   mac_fire;   // per-lane 1-cycle accumulate pulse (perf tally)
 
     // Drain gating: deferred until every lane's in-flight product has been
     // accumulated (mac_en_q all 0) and no new product is being formed this
@@ -181,6 +182,7 @@ module pe #(
                 .consume        (consume),
                 .drain_busy_any (drain_busy),
                 .mac_busy       (mac_en_q[k]),
+                .mac_fire       (mac_fire[k]),
                 .drain_pulse    (acc_drain_pulse),
                 .drain_busy     (pe_drain_busy_w[k]),
                 .out_ready      (out_ready[k]),

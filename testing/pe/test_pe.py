@@ -245,19 +245,21 @@ class PerfCounters:
 
 
 async def _mac_cycle_monitor(dut, perf, stop):
-    """Count total cycles + useful MACs from the registered mac_en_q (no race
-    with the driver, which counts the handshake itself)."""
+    """Count total cycles + useful MACs from mac_fire (a 1-cycle pulse per
+    accumulate). NOTE: mac_en_q is now the multi-cycle "MAC in flight" drain
+    gate (the multiplier is deeply pipelined), so it would over-count by the
+    pipeline fill/drain tail -- mac_fire is the exact per-MAC event."""
     while True:
         await RisingEdge(dut.clk)
         # Check stop in the writable region so the monitor never returns parked
         # in ReadOnly (which would block the next case's driver writes).
         if stop.is_set():
             break
-        await ReadOnly()            # sample mac_en_q in the settled region
+        await ReadOnly()            # sample mac_fire in the settled region
         perf.cycles += 1
-        me = _safe_int(dut.mac_en_q)
-        if me:
-            perf.macs += _popcount(me)
+        mf = _safe_int(dut.mac_fire)
+        if mf:
+            perf.macs += _popcount(mf)
 
 
 async def stream_fifo_b_perf(dut, fifo_b, perf, sig_need_fetch):

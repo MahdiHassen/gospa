@@ -43,7 +43,8 @@ NUM_CID := $(shell echo $$(( $(E) * $(E) )))
 
 export H F S NUM_PE NUM_MULTS WAVES
 
-COMMON_RTL := $(RTL)/common/sram.sv $(RTL)/pe/pe_lane.sv \
+COMMON_RTL := $(RTL)/common/arith/rca_add.sv $(RTL)/common/arith/mult_pipe.sv \
+              $(RTL)/common/sram.sv $(RTL)/pe/pe_lane.sv \
               $(RTL)/pe/pe_mem.sv $(RTL)/pe/pe_fetch.sv $(RTL)/pe/pe.sv
 
 ifeq ($(DUT),array)
