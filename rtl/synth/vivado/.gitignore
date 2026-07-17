@@ -1,0 +1,4 @@
+# Vivado run directory: ignore all run artifacts, track only the flow script.
+*
+!.gitignore
+!run_synth.tcl

@@ -1,0 +1,12 @@
+# Vivado run artifacts (journal / log / reports land in the invocation dir)
+*.jou
+*.log
+*.rpt
+*.backup.*
+*.dcp
+*.pb
+.Xil/
+build_rtl/
+clockInfo.txt
+iter_*.txt
+cong/
