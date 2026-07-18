@@ -3,7 +3,8 @@ goSPA performance model -- Layer descriptor and multi-pass expansion.
 
 Sits above perf_model.py (which scores one pass) and config.py (hardware knobs).
 Adds the two outer loops perf_model does not own:
-  - output-channel tiling: ceil(Cout / (N_PE * M)) tiles            (sec.5)
+  - output-channel tiling: ceil(Cout / tile) tiles, tile = N_PE*M ("channel")
+    or N_PE ("act" -- one kernel/PE, so M x more tiles)              (sec.5)
   - input-channel passes:  Cin passes per tile; accumulators persist (sec.5)
 Applies FILL / DRAIN bracketing (sec.4) and the once-per-layer output store
 (sec.5 -- perf_model.py deliberately omits the output write-back).
@@ -80,7 +81,7 @@ class LayerStats:
     fill_cycles: int
     drain_cycles: int
     out_store_cycles: int    # output writeback charged once per layer (sec.5)
-    n_out_tiles: int         # ceil(Cout / (N_PE * M))
+    n_out_tiles: int         # ceil(Cout / tile); tile = N_PE*M ("channel") | N_PE ("act")
     n_passes: int            # n_out_tiles * Cin (conv/1x1/fc) | n_out_tiles (dw)
     E: int                   # output spatial dimension (E x E feature map)
     per_pass: list = field(default_factory=list)   # list[PassStats]
@@ -119,7 +120,9 @@ def simulate_layer(layer: Layer, cfg: HwConfig, seed: int = 0) -> LayerStats:
     H_eff = layer.H + 2 * layer.pad
     W_eff = layer.W + 2 * layer.pad
     E = (H_eff - layer.F) // layer.S + 1
-    tile_size = cfg.N_PE * cfg.M
+    # "channel" packs N_PE*M output channels per tile (M kernels/PE); "act"
+    # packs only N_PE (one kernel/PE), so it needs M x more tiles (and passes).
+    tile_size = cfg.N_PE * cfg.M if cfg.ARCH == "channel" else cfg.N_PE
     n_out_tiles = ceil(layer.Cout / tile_size)
 
     rng = random.Random(seed)
@@ -258,6 +261,25 @@ def _selftest():
     # 7) Bottleneck histogram covers all passes.
     check("bottleneck_hist sums to n_passes",
           sum(stats.bottleneck_hist.values()) == stats.n_passes)
+
+    # 8) act arch: one kernel/PE tiling (M x more tiles); util is decoupled from
+    #    weight density, so on a weight-sparse conv it beats channel arch.
+    cfg_ch = HwConfig(N_PE=4, M=2, FILL=0, DRAIN=0, ARCH="channel")
+    cfg_ac = HwConfig(N_PE=4, M=2, FILL=0, DRAIN=0, ARCH="act")
+    lyr = Layer(H=10, W=10, F=3, S=1, pad=0, Cin=2, Cout=16,
+                type="conv", d_a=0.8, d_w=0.4)
+    st_ch = simulate_layer(lyr, cfg_ch, seed=7)
+    st_ac = simulate_layer(lyr, cfg_ac, seed=7)
+    print(f"  arch: ch tiles={st_ch.n_out_tiles} util={st_ch.lane_util:.3f} | "
+          f"act tiles={st_ac.n_out_tiles} util={st_ac.lane_util:.3f}")
+    check("act n_out_tiles == ceil(Cout / N_PE)",
+          st_ac.n_out_tiles == ceil(lyr.Cout / cfg_ac.N_PE))
+    check("act has M x channel's tiles",
+          st_ac.n_out_tiles == cfg_ac.M * st_ch.n_out_tiles)
+    check("act n_passes == n_out_tiles * Cin",
+          st_ac.n_passes == st_ac.n_out_tiles * lyr.Cin)
+    check("act util > channel util (sparse weights)",
+          st_ac.lane_util > st_ch.lane_util)
 
     print(f"\nlayer self-test: {'PASS' if ok else 'FAIL'}")
     return ok

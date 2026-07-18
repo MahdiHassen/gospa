@@ -16,7 +16,18 @@ from typing import Callable, Optional, Union
 class HwConfig:
     # --- array geometry ---------------------------------------------------
     N_PE: int = 8            # number of PEs
-    M: int = 4               # multipliers (= output channels) per PE
+    M: int = 4               # multipliers per PE (output channels in "channel"
+                             # arch; activation lanes in "act")
+
+    # --- dataflow mode ----------------------------------------------------
+    # "channel": M kernels/PE, one activation broadcast to M lanes, per-lane
+    #            WSPs union-gated. Multiplier utilization is capped at weight
+    #            density (the union over-admission penalty).
+    # "act":     one kernel/PE shared by all M multipliers; M activations
+    #            consumed per cycle (bundled by PID, <=M per bundle); single
+    #            WSP, no union. Utilization is set by PID-group length and is
+    #            ~independent of weight density.
+    ARCH: str = "channel"
 
     # --- clock ------------------------------------------------------------
     FREQ_HZ: float = 1e9     # TODO(sec.10): paper clock frequency
@@ -34,9 +45,15 @@ class HwConfig:
     RELOAD_MODEL: str = "double_buffer"   # "double_buffer" | "simple" | "ideal"
 
     # --- APU Stage 1 enumerator ------------------------------------------
-    # "serial":   stage1 = n_nz + n_pairs   (1 decode + 1 per emitted pair)
-    # "unrolled": stage1 = max(n_nz, n_pairs)
-    STAGE1_ENUM: str = "serial"
+    # "parallel": stage1 = n_nz            RTL-faithful. idgen is a purely
+    #             combinational G^2 fan-out (PIPE=0) and one activation's pairs
+    #             carry distinct PIDs, so they land in G^2 different FIFO-A
+    #             lanes in the same cycle -> 1 activation/cycle. Downstream
+    #             back-pressure is captured by the max() over stages.
+    #             (see rtl/apu/stage1/idgen.sv, apu_stage1.sv)
+    # "unrolled": stage1 = max(n_nz, n_pairs)   1-pair/cycle emit (analysis knob)
+    # "serial":   stage1 = n_nz + n_pairs       serial emit (pessimistic knob)
+    STAGE1_ENUM: str = "parallel"
 
     # --- memory (fixed-latency + bandwidth; the calibration target) ------
     MEM_BW_BYTES: int = 16        # B: bytes moved per cycle

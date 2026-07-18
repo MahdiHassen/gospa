@@ -170,6 +170,11 @@ if __name__ == "__main__":
     parser.add_argument("--net", default="alexnet",
                         choices=["alexnet", "mobilenetv2"],
                         help="workload to simulate (default: alexnet)")
+    parser.add_argument("--arch", default="channel",
+                        choices=["channel", "act"],
+                        help="dataflow: 'channel' (M kernels/PE, union WSP) or "
+                             "'act' (1 kernel/PE, M activations/cycle) "
+                             "(default: channel)")
     parser.add_argument("--no-baseline", action="store_true",
                         help="skip dense comparison run")
     parser.add_argument("--da", default=0.5,
@@ -185,7 +190,7 @@ if __name__ == "__main__":
         from workloads.mobilenetv2 import LAYERS
         net_label = "MobileNetV2"
 
-    cfg = HwConfig()   # defaults: N_PE=8, M=4, FREQ_HZ=1e9
+    cfg = HwConfig(ARCH=args.arch)   # defaults: N_PE=8, M=4, FREQ_HZ=1e9
 
     new_layers = []
     if args.da == 0.5 and args.dw == 0.5:
@@ -196,6 +201,7 @@ if __name__ == "__main__":
 
     print(f"goSPA perf model -- {net_label}")
     print(f"  HW : N_PE={cfg.N_PE}  M={cfg.M}  FREQ={cfg.FREQ_HZ/1e9:.1f} GHz")
+    print(f"  Arch : {cfg.ARCH}  (Stage-1 enum: {cfg.STAGE1_ENUM})")
     print(f"  Sparsity : d_a={new_layers[0].d_a}  d_w={new_layers[0].d_w}  (synthetic phase-1)")
     print(f"  Baseline : {'disabled' if args.no_baseline else 'enabled (doubles runtime)'}")
     print(f"  Layers   : {len(new_layers)}")

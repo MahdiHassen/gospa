@@ -106,13 +106,16 @@ against the RTL testbenches (July milestones) if the discrepancy proves material
 Run the functional pass to obtain, per layer/pass: the decoded `(CID,PID)` pair
 stream, the F²×FIFO-A contents, and `fifo_b[k]` for each PE `k`.
 
-- **APU Stage 1 (ID-gen):** ~1 non-zero activation decoded/cycle, each emitting up
-  to `G²` `(CID,PID)` pairs, where `G = ceil(F/S)` (the model uses `ceil`, not
-  `floor` — an `F`-not-divisible-by-`S` kernel must still reach its last row/col).
-  The *actual* count is `≤ G²`: the `E`-range and `F`-range gates in
-  `pcid_to_cid_pid` drop out-of-bounds `(m,n)`.
-  `stage1 ≈ Σ_nz (1 + pairs_emitted)` (or `max(#nz, #pairs)` if the enumerator is
-  unrolled — config knob). Input rate is bounded by activation read bandwidth.
+- **APU Stage 1 (ID-gen):** the RTL (`rtl/apu/stage1/idgen.sv`, `apu_stage1.sv`) is a
+  purely **combinational `G²` fan-out** (`PIPE=0`): one activation's up-to-`G²` pairs
+  carry **distinct PIDs** (the `(m,n)→PID` map is injective) and land in `G²`
+  *different* FIFO-A lanes in the **same cycle**, so throughput is **1 activation/cycle
+  → `stage1 = n_nz`** (`STAGE1_ENUM = "parallel"`, the RTL-faithful **default**).
+  `G = ceil(F/S)` (`ceil`, not `floor`); the `E`/`F`-range gates in `pcid_to_cid_pid`
+  drop out-of-bounds `(m,n)`. Kept as analysis knobs: `"unrolled"` = `max(n_nz,
+  n_pairs)` (1-pair/cycle emit) and `"serial"` = `n_nz + n_pairs` (serial emit, the old
+  default). Stage-1 stalls on FIFO-A-full (the all-or-nothing join in `apu_stage1.sv`)
+  are captured by the per-pass `max()` over stages, not charged here.
 - **APU Stage 2 (router/broadcast):** drains FIFO-A in PID order, ~1 entry
   broadcast/cycle (fan-out to matching PEs is parallel).
   `stage2 ≈ Σ_pid len(FIFO_A[pid])`.
@@ -278,3 +281,59 @@ Single-pass `N_PE×M` packing are **reused** from `functional.py`, not rebuilt h
 
 **Critical path to a first end-to-end number: 3 → 4 → 7** (with 1 as prerequisite).
 Steps 5, 6, and 8 can land in parallel.
+
+---
+
+## 12. Dataflow architectures (`--arch`)
+
+`§2` describes the **`channel`** dataflow (the default). A second dataflow, **`act`**,
+was added to attack `channel`'s core inefficiency. Selected by `HwConfig.ARCH` /
+`sim.py --arch {channel,act}`. The whole front end (`goSPA_route`, Stage 1) is shared;
+only the PE mapping, the FIFO-A→B transfer, and the output-channel tiling differ. No
+`functional.py` change was needed — `act` reuses `goSPA_route(interpretation="v1")`.
+
+**Motivation.** In `channel`, FIFO-B admission is by the **union** of a PE's `M`
+per-lane WSPs, but lane `c` only does useful work when *its own* `WSP_c[PID]=1`. So
+multiplier utilization is capped at ~weight density (`sw/unioin_wsp_util.csv`: util
+tracks `d_w` almost exactly — 0.49 @ `d_w=0.5`, 0.27 @ `d_w=0.1`).
+
+| | **`channel`** (default) | **`act`** |
+|---|---|---|
+| per PE | `M` kernels (`M` output channels) | **1 kernel**, shared by all `M` mults |
+| within PE | 1 activation → `M` lanes | **`M` activations → `M` mults** |
+| WSP | `M` per-lane, **union**-gated | **single** WSP, no union |
+| output chans/pass | `N_PE·M` | **`N_PE`** (⇒ `M×` more tiles/passes) |
+| Stage 2 | `n_pairs` (1 pair/cycle) | **`ceil(n_pairs / M)`** (M-wide FIFO-A→B) |
+| PE `k` cycles | `\|FIFO_B_k\|` + reload(`P=M`) | **`Σ_g ceil(run_len_g / M)`**, no reload |
+| useful MACs / PE | `Σ popcount(lane WSPs)` | `\|FIFO_B_k\|` |
+| util ceiling | ≈ `d_w` | ≈ `1 − tail`, set by PID-run length ⟂ `d_w` |
+
+**`act` PE model (decision B2, `perf_pe.py:pe_perf_actparallel`).** FIFO-B is
+PID-ordered, so it is bundled into contiguous PID runs; up to `M` activations of a run
+are consumed per cycle against that run's single resident weight → `ceil(run_len/M)`
+cycles per run. The whole `F²` kernel is resident, so there is **no per-PID reload**
+(one-time kernel load folds into `FILL`). The only idle lane-slots are each run's
+partial last cycle (the "tail"), so utilization is governed by average run length
+`≈ n_pairs/F²`, which is **independent of weight density**.
+
+**Key finding (synthetic phase-1).** `act` raises multiplier utilization exactly as
+predicted, but it is **not** a free win on wall-clock:
+- Utilization jumps (small 2-layer net: **0.49 → 0.96**; conv layers ~0.98).
+- But `act` re-streams the activation `M×` more (one front-end run per `N_PE`-channel
+  tile), and with Stage 1 left un-widened at `n_nz`, the **front end becomes the
+  bottleneck**. Total Stage-2 work is mode-invariant (the `M`-wide transfer cancels the
+  `M×` passes), but total Stage-1 work is `M×` higher.
+- Net: `act` is roughly **wall-clock-neutral on `3×3` convs** (long PID runs, PE-bound)
+  but **loses badly on `1×1`/FC** (`F²=1` ⇒ `n_nz = n_pairs`, Stage-1-bound, full `M×`
+  penalty). In the 2-layer probe: `3×3` 3447→3495 cyc; `1×1` 1741→5172 cyc.
+- **Cross-arch comparison must use absolute cycles**, not *speedup-vs-dense*: each arch
+  is compared to its *own* dense baseline, which flatters `act` (1.71× vs 1.53×) even
+  though it is slower in absolute cycles. Array efficiency is the honest headline
+  (`channel` 45% → `act` 22% on the probe).
+
+**Takeaway.** The union penalty and the re-stream penalty are *two different*
+inefficiencies; `act` trades the first for the second. It is attractive only where PID
+runs are long **and** the front end is not the binding stage — so a genuine `act` win
+likely also needs a widened Stage 1 (the `STAGE1_ENUM` knob can explore this). Real
+sparsity maps (§6) may shift the crossover; the model now reports the bottleneck
+per layer so the trade is measured, not assumed.

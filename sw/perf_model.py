@@ -1,10 +1,10 @@
 """
 goSPA performance model -- per-pass cycle accounting.
 
-This is the per-PASS engine that sits between `perf_pe.py` (one PE) and the
-future `layer.py` (whole layer). A *pass* is one front-end routing run -- one
-input channel over one output-channel tile of <= N_PE*M channels. Given that
-pass's routed data it:
+This is the per-PASS engine that sits between `perf_pe.py` (one PE) and
+`layer.py` (whole layer). A *pass* is one front-end routing run -- one input
+channel over one output-channel tile (<= N_PE*M channels in "channel" arch,
+<= N_PE in "act"). Given that pass's routed data it:
 
   - counts APU Stage 1 (ID-gen) and Stage 2 (router/broadcast),
   - calls perf_pe per PE and takes pe_stage = max_k pe_cycles  (load imbalance),
@@ -17,15 +17,16 @@ accumulation is reused from functional.goSPA_multichannel (resident
 accumulators), so a layer is just a sequence of passes this module scores.
 
 Routing comes from functional.goSPA_route -- the perf model instruments the real
-v2 dataflow, it does not re-implement it. All hardware parameters arrive via
-HwConfig (config.py). See PERF_MODEL_PLAN.md sec.3/4/5/11.
+dataflow (v2 for "channel", v1 for "act"), it does not re-implement it. The
+dataflow is chosen by HwConfig.ARCH; all hardware parameters arrive via HwConfig
+(config.py). See PERF_MODEL_PLAN.md sec.3/4/5/11.
 """
 
 from dataclasses import dataclass, field
 from math import ceil
 
 import functional as fn
-from perf_pe import pe_perf_from_stream, PEStats
+from perf_pe import pe_perf_from_stream, pe_perf_actparallel, PEStats
 from config import HwConfig
 
 
@@ -73,7 +74,14 @@ class PassStats:
 # ---------------------------------------------------------------------------
 
 def _stage1_cycles(routed, cfg):
-    """APU Stage 1: ~1 non-zero decoded/cycle, each emitting up to G^2 pairs."""
+    """APU Stage 1 (ID-gen) cycle count -- see HwConfig.STAGE1_ENUM.
+
+    "parallel" (RTL-faithful default): idgen is a combinational G^2 fan-out that
+    pushes one activation's pairs to G^2 distinct FIFO-A lanes in a single
+    cycle, so throughput is 1 activation/cycle -> n_nz. Downstream back-pressure
+    (FIFO-A full) is captured by score_pass's max() over stages, not here."""
+    if cfg.STAGE1_ENUM == "parallel":
+        return routed.n_nz
     if cfg.STAGE1_ENUM == "serial":
         return routed.n_nz + routed.n_pairs
     if cfg.STAGE1_ENUM == "unrolled":
@@ -104,18 +112,32 @@ def _mem_cycles(routed, cfg):
 def score_pass(routed, cfg):
     """Score one already-routed pass. Pure: no functional re-run, no I/O."""
     stage1 = _stage1_cycles(routed, cfg)
-    stage2 = routed.n_pairs   # each FIFO-A entry drained once; fan-out parallel
 
-    per_pe = [
-        pe_perf_from_stream(
-            fb, routed.pe_lane_wsps[k],
-            w_update_penalty=cfg.W_UPDATE_PENALTY,
-            w_fetch_latency=cfg.W_FETCH_LATENCY,
-            w_fetch_bw=cfg.W_FETCH_BW,
-            reload_model=cfg.RELOAD_MODEL,
-        )
-        for k, fb in enumerate(routed.fifo_b_list)
-    ]
+    if cfg.ARCH == "act":
+        # One kernel/PE shared by M multipliers. The FIFO-A -> FIFO-B transfer
+        # is widened to M activations/cycle, so Stage 2 drains at M pairs/cycle.
+        # pe_lane_wsps[k] is a single-element list (one WSP) under v1 routing.
+        stage2 = ceil(routed.n_pairs / max(1, cfg.M))
+        per_pe = [
+            pe_perf_actparallel(fb, routed.pe_lane_wsps[k][0], cfg.M)
+            for k, fb in enumerate(routed.fifo_b_list)
+        ]
+    elif cfg.ARCH == "channel":
+        # M kernels/PE, one activation broadcast to M lanes; the router drains
+        # one FIFO-A entry/cycle and fans it out to all PEs in parallel.
+        stage2 = routed.n_pairs
+        per_pe = [
+            pe_perf_from_stream(
+                fb, routed.pe_lane_wsps[k],
+                w_update_penalty=cfg.W_UPDATE_PENALTY,
+                w_fetch_latency=cfg.W_FETCH_LATENCY,
+                w_fetch_bw=cfg.W_FETCH_BW,
+                reload_model=cfg.RELOAD_MODEL,
+            )
+            for k, fb in enumerate(routed.fifo_b_list)
+        ]
+    else:
+        raise ValueError(f"unknown ARCH {cfg.ARCH!r}")
     pe_cycles = [s.pe_cycles for s in per_pe]
     pe_stage = max(pe_cycles) if pe_cycles else 0
 
@@ -143,8 +165,14 @@ def score_pass(routed, cfg):
     )
 
 
-def run_pass(activation, kernels_tile, stride, cfg, *, interpretation="v2"):
-    """Drive the functional front end for one output tile, then score it."""
+def run_pass(activation, kernels_tile, stride, cfg, *, interpretation=None):
+    """Drive the functional front end for one output tile, then score it.
+
+    The routing interpretation follows cfg.ARCH unless overridden: "channel" ->
+    "v2" (M kernels/PE, union WSP), "act" -> "v1" (one kernel/PE, single WSP).
+    Both share the same front end; only the PE mapping differs."""
+    if interpretation is None:
+        interpretation = "v1" if cfg.ARCH == "act" else "v2"
     r = fn.goSPA_route(activation, kernels_tile, stride,
                        num_pes=cfg.N_PE, num_mults=cfg.M,
                        interpretation=interpretation)
@@ -220,6 +248,34 @@ def _selftest():
     s_unroll = _stage1_cycles(rp, cfg_u)
     check("stage1 serial == n_nz + n_pairs", s_serial == r.n_nz + r.n_pairs)
     check("stage1 serial >= unrolled", s_serial >= s_unroll)
+
+    # 5) parallel Stage-1 (the RTL-faithful default) == n_nz.
+    cfg_p = HwConfig(STAGE1_ENUM="parallel")
+    s_par = _stage1_cycles(rp, cfg_p)
+    check("stage1 parallel == n_nz", s_par == r.n_nz)
+    check("stage1 serial >= parallel", s_serial >= s_par)
+
+    # 6) act arch on a weight-sparse, large-fmap case: Stage 2 drains M/cycle,
+    #    no PE reloads, and lane util beats channel arch (union penalty gone).
+    big = [[((i * 7 + j) % 5) for j in range(8)] for i in range(8)]   # ~sparse act
+    ksparse = [[[1, 0], [0, 0]], [[0, 1], [0, 0]], [[1, 0], [0, 1]]]  # sparse wgts
+    cfg_act = HwConfig(N_PE=8, M=4, ARCH="act")
+    cfg_ch = HwConfig(N_PE=8, M=4, ARCH="channel")
+    r_act = fn.goSPA_route(big, ksparse, 1, num_pes=8, num_mults=4,
+                           interpretation="v1")
+    ps_act = run_pass(big, ksparse, 1, cfg_act)
+    ps_ch = run_pass(big, ksparse, 1, cfg_ch)
+    print(f"  arch cmp: act util={ps_act.lane_util:.3f} "
+          f"ch util={ps_ch.lane_util:.3f} | "
+          f"act(s2={ps_act.stage2_cycles} pe={ps_act.pe_stage_cycles}) "
+          f"ch(s2={ps_ch.stage2_cycles} pe={ps_ch.pe_stage_cycles})")
+    check("act stage2 == ceil(n_pairs / M)",
+          ps_act.stage2_cycles == ceil(r_act.n_pairs / 4))
+    check("act one kernel per PE", len(ps_act.per_pe) == len(ksparse))
+    check("act no PE reloads", all(s.num_reloads == 0 for s in ps_act.per_pe))
+    check("act lane_util in [0,1]", 0.0 <= ps_act.lane_util <= 1.0)
+    check("act util > channel util (sparse weights)",
+          ps_act.lane_util > ps_ch.lane_util)
 
     print(f"\nperf_model self-test: {'PASS' if ok else 'FAIL'}")
     return ok
