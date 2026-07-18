@@ -49,6 +49,17 @@ metric gathering toward the final report.
 ---
 
 ### 1.2 Fred Huang
+- **Profiling performance model** done based on a sweep of activation/weight density, determined discrepancy of bottleneck between paper & implemented architecture.
+  - Collaborated with other team members to bring up full workloads on performance model in a PE -> Pass -> Layer -> Sim hierarchy
+  - Added configurable synthetic workload where weight and activation density can be controlled by `--dw` and `da`.
+  - Verified the observation that multiplier utilization scales linearly with almost a factor of 1 with weight density.
+- **Performance model refinement** according to newly proposed architecture (See section 3).
+  - Added parallel mode to APU software model to accurately capture the hardware behavior (update on previous assumption)
+  - Added `act` option for `--arch` in performance model to demostrate updated dataflow: one kernel/WSP per PE, `M` activations drained from FIFO-A's to FIFO-B's per cycle, observed increased per-lane utilization calculated as `useful_macs/pe_cycles`.
+
+Next:
+ - Modify lane utilization accounting logic to account for total compute cycles **not** assuming PEs are the bottleneck.
+ - Run experiments on design space exploration on the number of lanes per PE, plot number of lanes vs. util & wall-clock time, compare with original architecture.
 
 ---
 
@@ -96,11 +107,13 @@ Milestones are taken from the per-member table in `reports/plan.md`. Period cove
 
 | Member | Planned task | Status | Notes |
 |---|---|---|---|
-| Fred |  |  |  |
 | Mahdi | Intermediate CNN layers (maxpooling, fully connected) in HW | **Skipped** | No longer designed as dedicated RTL modules — handled in the TB / SW instead (see Section 3); effort redirected to top-level RTL integration |
 | Mahdi | Stitch RTL into the initial GoSPA top-level | **Met / exceeded** | Completed the initial top-level: updated `pe.sv` to match the architecture, added SRAM to the PE and APU, converted all modules to synchronous reset, added a pipeline stage in the PE, and modified the APU TB to measure perf metrics |
 | Mahdi | Verify against the functional model | **Met** | Verified against the functional model on MobileNetV2 Layer 1, extracted MobileNetV2 utilization numbers, and added verification tests including end-to-end classification of an image (class: granny smith apple) |
 | Mahdi | Mini-compiler | **Added** | Wrote a mini-compiler that maps a larger input computation onto the smaller GoSPA module |
+| Fred | Finish Perf Model | **Met** | Perf model for first-generation architecture done, second-generation largely implemented with a few details pending discussion |
+| Fred | PE testing | **Met** | Ran sweep on activation and weight densities, confirmed discrepancy in lane utilization together with the TB results from other group members |
+| Fred | Design Space Exploration | **Added** | With the new dataflow, run experiments with various hardware configurations to identify the best design specs |
 | Sara |  |  |  |
 | Emon | `apu.sv` with router & FIFOs | **Met** | APU top completed within the team; effort redirected to the PE |
 | Emon | APU full TB | **Met** | Full-APU test completed within the team |
@@ -112,7 +125,7 @@ Milestones are taken from the per-member table in `reports/plan.md`. Period cove
 
 The biggest change in the plan is changing out interpretation of the GoSPA architecture. The paper itself is ambiguous on certain aspects of the architecture, specifically how multiple kernels map within a PE. Our interpretation (dubbed V2 interpretation in functional.py) relies on each kernel mapping to one multiplier, and thus multiple kernels per PE. Upon implementing our interpretation in both the performance model and the RTL, we determined that our interpretation of the architecture does not yield the same results from the paper in terms of multiplier utilization.
 
-When evaluating an alternative interpretation in which a PE holds a single kernel, we achieve an increased multiplier utilization value. It's worth noting that this implementation seems to contradict the paper's claim that one activation is fed into a PE per cycle. To keep the PE fed, we must push in multiple activations every cycle. This contradiction was the main reason for the previous interpretation. 
+When evaluating an alternative interpretation in which a PE holds a single kernel, we achieve an increased multiplier utilization value. It's worth noting that this implementation seems to contradict the paper's claim that one activation is fed into a PE per cycle. To keep the PE fed, we must push in multiple activations every cycle. This contradiction was the main reason for the previous interpretation. One of the key challenges with this new dataflow is that with the PE array holding `M`x less kernels at a time, the activations will need to be streamed `M`x more times. It's hard to qualitatively decide whether this will result in an increased performance because the comput density within each PE has also increased (i.e., PE guraranteed 4 ops/cycle when active). To address this concern, more design space exploration will be needed as this is an optimization problem with `N_PE` and `M_LANES` as variables.
 
 Since the team is very ahead of schedule, we see value in spending time to implement this new interpretation in RTL and comparing it with our previous one.
 
