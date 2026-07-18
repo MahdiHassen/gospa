@@ -309,6 +309,115 @@ def pe_process(fifo_b, sparse_weights, pe_id=0, num_mults=4):
 
 
 # ---------------------------------------------------------------------------
+# Activation-parallel PE -- one stationary kernel, wide activation feed
+# ---------------------------------------------------------------------------
+
+def pe_process_actparallel(fifo_b, sparse_weights, pe_id=0, feed_width=4):
+    """Functionally execute one activation-parallel PE.
+
+    The PE holds one kernel.  Stage 2 supplies a PID-ordered scalar FIFO-B
+    stream and the PE consumes up to ``feed_width`` consecutive entries with
+    the same PID per cycle.  All entries in such a batch use the same resident
+    (stationary) weight::
+
+        ACCUM[CID] += Axy * weight[PID]
+
+    Batching affects only the schedule; it must not affect the accumulated
+    values.  Different PID groups cannot share a batch because they select
+    different stationary weights.
+
+    Args:
+        fifo_b: PID-ordered ``(Axy, CID, PID)`` entries from Stage 2.  Exact
+            single-kernel WSP gating is assumed, so every PID in the stream
+            must have a corresponding non-zero sparse weight.
+        sparse_weights: ``[(PID, weight), ...]`` for the PE's single kernel.
+        pe_id: Diagnostic identifier used only by verbose tracing.
+        feed_width: Activation lanes/multipliers in the PE.  Must be >= 1.
+
+    Returns:
+        A ``{CID: accumulated_value}`` dictionary.
+
+    Raises:
+        ValueError: If the feed width is invalid, the FIFO-B stream is not in
+            PID order, a PID has no stationary weight, or the sparse-weight
+            list contains duplicate PIDs.
+    """
+    if feed_width < 1:
+        raise ValueError(f"feed_width must be >= 1, got {feed_width}")
+
+    weight_by_pid = {}
+    for pid, weight in sparse_weights:
+        if pid in weight_by_pid:
+            raise ValueError(f"duplicate sparse weight for PID {pid}")
+        weight_by_pid[pid] = weight
+
+    if _VERBOSE:
+        print(f"[PE-act#{pe_id}] sparse_weights={sparse_weights}, "
+              f"stream_len={len(fifo_b)}, feed_width={feed_width}")
+    if not fifo_b:
+        if _VERBOSE:
+            print(f"[PE-act#{pe_id}] nothing to compute")
+        return {}
+
+    # Each activation lane owns an accumulator bank.  Combining the banks at
+    # readout mirrors pe_process() while avoiding same-cycle write contention.
+    lane_accums = [{} for _ in range(feed_width)]
+    i = 0
+    cycle = 0
+    previous_pid = None
+
+    while i < len(fifo_b):
+        head_pid = fifo_b[i][2]
+        if previous_pid is not None and head_pid < previous_pid:
+            raise ValueError(
+                f"FIFO-B must be PID-ordered, got PID {head_pid} after {previous_pid}"
+            )
+        if head_pid not in weight_by_pid:
+            raise ValueError(f"FIFO-B PID {head_pid} has no stationary weight")
+
+        # Find this complete PID run, then issue it in feed_width-sized cycles.
+        run_end = i
+        while run_end < len(fifo_b) and fifo_b[run_end][2] == head_pid:
+            run_end += 1
+
+        weight = weight_by_pid[head_pid]
+        for batch_start in range(i, run_end, feed_width):
+            cycle += 1
+            batch = fifo_b[batch_start:min(batch_start + feed_width, run_end)]
+            if _VERBOSE:
+                print(f"  cyc#{cycle} PID={head_pid} WGT={weight} "
+                      f"batch={len(batch)}/{feed_width}")
+
+            for lane, (axy, cid, pid) in enumerate(batch):
+                # The slice above must never cross a PID boundary.
+                if pid != head_pid:
+                    raise ValueError(
+                        f"mixed-PID batch: expected {head_pid}, got {pid}"
+                    )
+                product = axy * weight
+                lane_accums[lane][cid] = lane_accums[lane].get(cid, 0) + product
+                if _VERBOSE:
+                    print(f"    lane#{lane}: ACT={axy} CID={cid} | "
+                          f"{axy}*{weight}={product} "
+                          f"-> ACCUM_{lane}[{cid}]={lane_accums[lane][cid]}")
+
+        previous_pid = head_pid
+        i = run_end
+
+    combined = {}
+    for lane_accum in lane_accums:
+        for cid, value in lane_accum.items():
+            combined[cid] = combined.get(cid, 0) + value
+
+    if _VERBOSE:
+        print(f"[PE-act#{pe_id}] per-lane ACCUMs:")
+        for lane, lane_accum in enumerate(lane_accums):
+            print(f"  lane#{lane} = {dict(sorted(lane_accum.items()))}")
+        print(f"[PE-act#{pe_id}] combined ACCUM = {dict(sorted(combined.items()))}")
+    return combined
+
+
+# ---------------------------------------------------------------------------
 # PE v2 -- multi-WSP interpretation
 # ---------------------------------------------------------------------------
 
@@ -585,7 +694,8 @@ def goSPA_run(activation, kernels, stride,
 
     Mapping policies:
       "v1": one kernel per PE; needs len(kernels) <= num_pes.
-            Each PE uses pe_process (same-PID batching across `num_mults`).
+            Each PE uses pe_process_actparallel (one stationary kernel and
+            same-PID activation batches across `num_mults`).
       "v2": up to `num_mults` kernels per PE (one per lane); needs
             len(kernels) <= num_pes * num_mults.
             Each PE uses pe_process_v2 (one activation/cycle, lanes idle when
@@ -622,8 +732,9 @@ def goSPA_run(activation, kernels, stride,
         with _quiet():
             if interpretation == "v1":
                 k = chunk[0]
-                accum = pe_process(fb, routing.sw_lists[k],
-                                   pe_id=pe, num_mults=num_mults)
+                accum = pe_process_actparallel(
+                    fb, routing.sw_lists[k], pe_id=pe, feed_width=num_mults
+                )
                 outputs[k] = accum_to_matrix(accum, E)
             else:
                 accums = pe_process_v2(fb,
