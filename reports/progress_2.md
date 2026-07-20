@@ -96,6 +96,30 @@ Next Steps:
 
 ### 1.4 Sara Ahmad
 
+**Completed:**
+
+- **MobileNetV2 weights + simulation testing (`sw/workloads/mobilenetv2.py`).** Added the full
+  MobileNetV2 layer list (Table 2: initial conv, all 7 inverted-residual bottleneck groups
+  expand/depthwise/project, final 1x1 conv, classifier) so the perf model runs the network
+  end-to-end via `sim.py --net mobilenetv2`.
+- **`new_arch` branch verification.** Verified the new architectural design change (one kernel/PE
+  dataflow); checking the new PE cycle counts and utilization computations which supported
+  the team in bringing the `new_arch` modifications into master.
+- **Functional model of the new architecture (`sw/functional.py`).** Added `pe_process_actparallel`,
+  a one-kernel-per-PE, wide-activation-feed PE model, and wired it into the existing
+  `goSPA_route`/`goSPA_run` pipeline alongside the other PE interpretations. 
+- **New architecture testing (`sw/test_functional_actparallel.py`).** Wrote functional tests for the
+  activation-parallel, stationary-weight PE (`pe_process_actparallel`): stationary-weight grouping
+  across full and tail activation batches, confirmed the accumulated outputs are identical regardless
+  of `feed_width` (varying it only changes the scheduling of activations into the PE, not the
+  computed result), the v1 pipeline (`goSPA_run`) against the dense-convolution reference, the
+  empty-stream edge case, and input validation (`feed_width`, missing stationary weight, PID
+  ordering, duplicate sparse weights).
+
+**Next:** Since the new architecture identified the APU as the new bottleneck, build a small-scale
+model to verify this without relying on the current performance model's assumptions, and design a
+new APU stage architecture to reduce that bottleneck.
+
 ---
 
 ### 1.5 Adil Kazimov
@@ -114,7 +138,8 @@ Milestones are taken from the per-member table in `reports/plan.md`. Period cove
 | Fred | Finish Perf Model | **Met** | Perf model for first-generation architecture done, second-generation largely implemented with a few details pending discussion |
 | Fred | PE testing | **Met** | Ran sweep on activation and weight densities, confirmed discrepancy in lane utilization together with the TB results from other group members |
 | Fred | Design Space Exploration | **Added** | With the new dataflow, run experiments with various hardware configurations to identify the best design specs |
-| Sara |  |  |  |
+| Sara | Compare perf APU with HW APU | **Redirected** | Effort redirected to verifying the `new_arch` interpretation (PE cycle counts, utilization) that supported merging it into master, adding its functional model and tests, and adding MobileNetV2 weights + simulation testing |
+| Sara | Verification and testing of the `new_arch` model | **Added** | Verified the new architecture's PE cycle counts and utilization computations against the functional model, added the functional model of the new architecture, and tested it -- work that supported the team in bringing the `new_arch` modifications into master |
 | Emon | `apu.sv` with router & FIFOs | **Met** | APU top completed within the team; effort redirected to the PE |
 | Emon | APU full TB | **Met** | Full-APU test completed within the team |
 | Emon | Help finish PE remaining modules | **Met / exceeded**: built the full PE + PE array, a reusable pipelined arithmetic unit integrated into the PE, and the FPGA implementation flow (post-route Fmax ~226 MHz) |  |
