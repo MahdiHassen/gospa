@@ -134,7 +134,7 @@ Progress:
   - Ran synthesis on pe_array and gospa top level. Set up Xcelium for post-synthesis simulation and verified pe_array. 
   - Wrote TCL scripts for Innovus PAR. Patched numerous issues that were preventing PAR from completing.
   - Manually defined the floorplan, power rings and other things to run PAR.
-  - Ran 16 hour pe_array PAR that resulted in a design with over 10,000 DRC violations.
+  - Ran full pe_array PAR that resulted in a design with over 10,000 DRC violations.
   - Tried to patch ASAP7 further to resolve DRC violations but was halted by little to no support for this PDK in Innovus.
   - Coordinated the switch to OpenLane with Emon, leaving Cadence Flow as a backup plan, given that Genus synthesis works correctly.     
 
