@@ -1,196 +1,85 @@
 """
-goSPA performance model -- network-level simulation driver.
+MobileNetV2 layer list for the GoSPA perf model.
 
-Top driver (PERF_MODEL_PLAN.md sec.7/8/11.7). Runs a list of Layers through
-simulate_layer, sums to total cycles, and reports:
-  - per-layer and total latency (ms) + FPS
-  - lane utilization and per-PE load-imbalance factor
-  - speedup vs. dense baseline (headline vs. paper Table -- sec.8)
-  - achieved vs. ideal MAC throughput
+Architecture: Sandler et al., CVPR 2018 (Table 2), width_mult=1.0, input 224x224x3.
 
-Entry point:  python sim.py              (AlexNet, d_a=0.5, d_w=0.5)
-              python sim.py --no-baseline (skip the dense comparison run)
+Each inverted-residual "bottleneck" block is (expansion t, output channels c,
+repeat count n, first-repeat stride s; remaining repeats use stride 1) and
+lowers to up to three convs:
+  1. 1x1 pointwise "expand"    Cin -> Cin*t      (type "1x1"; skipped when t==1,
+                                                   matching the reference impl)
+  2. 3x3 depthwise             per-channel, stride s, pad=1   (type "dw")
+  3. 1x1 pointwise "project"   Cin*t -> c, linear (type "1x1")
+
+Average pooling and the residual (skip) adds are not modeled -- GoSPA targets
+conv/FC compute, same convention as workloads/alexnet.py. The final 1x1 conv
+(320 -> 1280) and classifier (1280 -> 1000) are modeled as in alexnet.py's
+fc7/fc8: F=H=W=1, treated as a plain matrix-vector op on the pooled 1x1 map.
+
+Sparsity values (d_a, d_w) are phase-1 placeholders (sec.6 of PERF_MODEL_PLAN.md).
+Replace with PyTorch-captured post-ReLU activation maps and pruned weight masks
+in phase 2.
 """
 
 import sys
 import os
-from dataclasses import dataclass, replace
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from config import HwConfig
-from layer import Layer, LayerStats, simulate_layer
+from layer import Layer
 
+# Phase-1 sparsity placeholders -- swap per-layer once real maps are available.
+_D_A = 0.5   # post-ReLU activation density
+_D_W = 0.5   # pruned weight density
 
-# ---------------------------------------------------------------------------
-# Network result record
-# ---------------------------------------------------------------------------
-
-@dataclass
-class NetworkStats:
-    per_layer: list           # list[LayerStats] -- sparse run
-    per_layer_dense: list     # list[LayerStats] -- dense baseline; [] if skipped
-    total_cycles: int
-    total_cycles_dense: int   # 0 if baseline not run
-    total_latency_ms: float
-    fps: float
-    speedup: float            # total_cycles_dense / total_cycles (1.0 if no baseline)
-    lane_util: float          # useful_macs / (pe_cycles * M) across all passes+layers
-    load_imbalance: float     # mean per-layer load-imbalance factor
-    achieved_macs_cycle: float   # useful_macs / total_wall_pass_cycles
-    ideal_macs_cycle: int        # N_PE * M
+# (expansion t, output channels c, repeat count n, first-repeat stride s)
+_BOTTLENECKS = [
+    (1,  16, 1, 1),
+    (6,  24, 2, 2),
+    (6,  32, 3, 2),
+    (6,  64, 4, 2),
+    (6,  96, 3, 1),
+    (6, 160, 3, 2),
+    (6, 320, 1, 1),
+]
 
 
-# ---------------------------------------------------------------------------
-# Network runner
-# ---------------------------------------------------------------------------
+def _build_layers():
+    layers = []
 
-def run_network(layers, cfg, *, seed=0, baseline=True):
-    """
-    Run each Layer through simulate_layer and return NetworkStats.
+    # conv1: 224x224x3 -> 112x112x32 (F=3, S=2, pad=1)
+    H, Cin = 224, 3
+    layers.append(Layer(H=H, W=H, F=3, S=2, pad=1, Cin=Cin, Cout=32,
+                         type="conv", d_a=_D_A, d_w=_D_W, name="conv1"))
+    H = (H + 2 * 1 - 3) // 2 + 1
+    Cin = 32
 
-    baseline=True (default): re-runs each layer at d_a=1.0, d_w=1.0 to
-    compute speedup vs dense (sec.8). Roughly doubles total runtime.
-    """
-    per_layer = []
-    per_layer_dense = []
+    for group, (t, c, n, s) in enumerate(_BOTTLENECKS):
+        for rep in range(n):
+            stride = s if rep == 0 else 1
+            hidden = Cin * t
+            tag = f"bneck{group}_{rep}"
 
-    for i, layer in enumerate(layers):
-        label = (layer.name or f"layer{i}")
-        print(f"  [{i+1}/{len(layers)}] {label:<8}", end=" ", flush=True)
+            if t != 1:
+                layers.append(Layer(H=H, W=H, F=1, S=1, pad=0, Cin=Cin, Cout=hidden,
+                                     type="1x1", d_a=_D_A, d_w=_D_W, name=f"{tag}_expand"))
 
-        stats = simulate_layer(layer, cfg, seed=seed + i)
-        per_layer.append(stats)
+            layers.append(Layer(H=H, W=H, F=3, S=stride, pad=1, Cin=hidden, Cout=hidden,
+                                 type="dw", d_a=_D_A, d_w=_D_W, name=f"{tag}_dw"))
+            H = (H + 2 * 1 - 3) // stride + 1
 
-        if baseline:
-            ds = simulate_layer(replace(layer, d_a=1.0, d_w=1.0), cfg, seed=seed + i)
-            per_layer_dense.append(ds)
-            spd = ds.layer_cycles / stats.layer_cycles
-            print(f"cycles={stats.layer_cycles:>12,}  util={stats.lane_util:.3f}  speedup={spd:.2f}x")
-        else:
-            print(f"cycles={stats.layer_cycles:>12,}  util={stats.lane_util:.3f}")
+            layers.append(Layer(H=H, W=H, F=1, S=1, pad=0, Cin=hidden, Cout=c,
+                                 type="1x1", d_a=_D_A, d_w=_D_W, name=f"{tag}_project"))
+            Cin = c
 
-    total_cycles = sum(s.layer_cycles for s in per_layer)
-    total_dense  = sum(s.layer_cycles for s in per_layer_dense) if baseline else 0
+    # conv2 (1x1): 7x7x320 -> 7x7x1280
+    layers.append(Layer(H=H, W=H, F=1, S=1, pad=0, Cin=Cin, Cout=1280,
+                         type="1x1", d_a=_D_A, d_w=_D_W, name="conv2"))
 
-    freq = max(1.0, cfg.FREQ_HZ)
-    total_latency_ms = total_cycles / freq * 1000.0
-    fps = 1000.0 / total_latency_ms if total_latency_ms else 0.0
-    speedup = total_dense / total_cycles if (baseline and total_cycles) else 1.0
+    # classifier: 1280 -> 1000, applied on the pooled 1x1 map (1x1 conv)
+    layers.append(Layer(H=1, W=1, F=1, S=1, pad=0, Cin=1280, Cout=1000,
+                         type="fc", d_a=_D_A, d_w=_D_W, name="classifier"))
 
-    # Utilization: sum useful MACs / sum (pe_cycles * M) across all layers+passes+PEs
-    useful = sum(s.useful_macs
-                 for ls in per_layer
-                 for ps in ls.per_pass
-                 for s  in ps.per_pe)
-    slots  = sum(s.pe_cycles * s.M
-                 for ls in per_layer
-                 for ps in ls.per_pass
-                 for s  in ps.per_pe)
-    lane_util = useful / slots if slots else 0.0
-
-    # Achieved throughput: useful MACs per wall-clock pass cycle
-    wall_cycles = sum(ls.pass_cycles_total for ls in per_layer)
-    ideal = cfg.N_PE * cfg.M
-    achieved_macs_cycle = useful / wall_cycles if wall_cycles else 0.0
-
-    imbalances = [ls.load_imbalance for ls in per_layer]
-    load_imbalance = sum(imbalances) / len(imbalances) if imbalances else 1.0
-
-    return NetworkStats(
-        per_layer=per_layer,
-        per_layer_dense=per_layer_dense,
-        total_cycles=total_cycles,
-        total_cycles_dense=total_dense,
-        total_latency_ms=total_latency_ms,
-        fps=fps,
-        speedup=speedup,
-        lane_util=lane_util,
-        load_imbalance=load_imbalance,
-        achieved_macs_cycle=achieved_macs_cycle,
-        ideal_macs_cycle=ideal,
-    )
+    return layers
 
 
-# ---------------------------------------------------------------------------
-# Report
-# ---------------------------------------------------------------------------
-
-def print_report(net, layers, cfg):
-    has_baseline = bool(net.per_layer_dense)
-    freq = max(1.0, cfg.FREQ_HZ)
-    ideal = cfg.N_PE * cfg.M
-
-    col = f"{'Layer':<8}  {'Cycles':>12}  {'Lat(ms)':>8}  {'Util':>6}  {'Imbal':>6}  {'Bottleneck':>10}"
-    if has_baseline:
-        col += f"  {'Speedup':>7}"
-    sep = "-" * len(col)
-
-    print(sep)
-    print(col)
-    print(sep)
-
-    for i, (ls, layer) in enumerate(zip(net.per_layer, layers)):
-        lat = ls.layer_cycles / freq * 1000.0
-        bk  = max(ls.bottleneck_hist, key=ls.bottleneck_hist.get) if ls.bottleneck_hist else "-"
-        name = (layer.name or f"layer{i}")[:8]
-        row = (f"{name:<8}  {ls.layer_cycles:>12,}  {lat:>8.3f}  "
-               f"{ls.lane_util:>6.3f}  {ls.load_imbalance:>6.3f}  {bk:>10}")
-        if has_baseline:
-            spd = net.per_layer_dense[i].layer_cycles / ls.layer_cycles
-            row += f"  {spd:>6.2f}x"
-        print(row)
-
-    print(sep)
-    total_row = (f"{'TOTAL':<8}  {net.total_cycles:>12,}  {net.total_latency_ms:>8.3f}  "
-                 f"{net.lane_util:>6.3f}  {net.load_imbalance:>6.3f}  {'':>10}")
-    if has_baseline:
-        total_row += f"  {net.speedup:>6.2f}x"
-    print(total_row)
-    print(sep)
-
-    print()
-    print(f"FPS                  : {net.fps:.2f}")
-    print(f"Achieved throughput  : {net.achieved_macs_cycle:.2f} MACs/cycle  "
-          f"(ideal {ideal}  ->  {net.achieved_macs_cycle / ideal * 100:.1f}% array efficiency)")
-    if has_baseline:
-        print(f"Speedup vs dense     : {net.speedup:.2f}x")
-        print(f"  paper target (AlexNet): 1.38x  -- gap explained by synthetic sparsity")
-        print(f"  placeholders (d_a={layers[0].d_a}, d_w={layers[0].d_w}); "
-              f"replace with real maps for paper replication (sec.9)")
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import argparse
-    sys.path.insert(0, os.path.dirname(__file__))
-
-    parser = argparse.ArgumentParser(description="goSPA network-level performance model")
-    parser.add_argument("--net", default="alexnet",
-                        choices=["alexnet", "mobilenetv2"],
-                        help="workload to simulate (default: alexnet)")
-    parser.add_argument("--no-baseline", action="store_true",
-                        help="skip dense comparison run")
-    args = parser.parse_args()
-
-    if args.net == "alexnet":
-        from workloads.alexnet import LAYERS
-        net_label = "AlexNet"
-    else:
-        from workloads.mobilenetv2 import LAYERS
-        net_label = "MobileNetV2"
-
-    cfg = HwConfig()   # defaults: N_PE=8, M=4, FREQ_HZ=1e9
-
-    print(f"goSPA perf model -- {net_label}")
-    print(f"  HW : N_PE={cfg.N_PE}  M={cfg.M}  FREQ={cfg.FREQ_HZ/1e9:.1f} GHz")
-    print(f"  Sparsity : d_a={LAYERS[0].d_a}  d_w={LAYERS[0].d_w}  (synthetic phase-1)")
-    print(f"  Baseline : {'disabled' if args.no_baseline else 'enabled (doubles runtime)'}")
-    print(f"  Layers   : {len(LAYERS)}")
-    print()
-
-    net = run_network(LAYERS, cfg, seed=0, baseline=not args.no_baseline)
-
-    print()
-    print_report(net, LAYERS, cfg)
+LAYERS = _build_layers()
