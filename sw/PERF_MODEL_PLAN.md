@@ -203,8 +203,17 @@ tests/            # unit tests: per-stage cycle counts + invariants
 
 Per layer and per network:
 - total cycles → latency (ms) and FPS via `FREQ_HZ`;
-- multiplier (lane) utilization and per-PE **load-imbalance factor**
-  (`max_k pe_cycles / mean_k pe_cycles`);
+- **array utilization (wall-clock)** `array_util = Σ useful_MACs / (Σ pass_cycles ·
+  N_PE · M)` and per-PE **load-imbalance factor** (`max_k pe_cycles / mean_k
+  pe_cycles`). The denominator is `pass_cycles` (the *whole* physical array over the
+  pass wall-clock), **not** each PE's `pe_cycles`, so it charges every multiplier-slot
+  idled when the PE array is not the bottleneck — front-end/mem stall (`pass_cycles >
+  pe_stage`), cross-PE imbalance, and PEs left idle on a partial tile. It never exceeds
+  the PE-intrinsic ratio `useful / (Σ pe_cycles·M)`, with equality only when the pass is
+  PE-bound, balanced and full. (The PE-intrinsic per-lane ratio — the union-penalty
+  diagnostic of §"channel" — still lives in `perf_pe.py` as `overall/compute_lane_util`;
+  it answers a *different* question and is not the reported aggregate.) This aggregate
+  equals `achieved_macs_cycle / ideal` by construction;
 - achieved vs. ideal MAC throughput;
 - **speedup vs. a dense baseline** (same array, no sparsity skipping) — the headline
   number to compare against the paper's Table.
@@ -254,7 +263,7 @@ Single-pass `N_PE×M` packing are **reused** from `functional.py`, not rebuilt h
    the new pure `functional.goSPA_route` (shared with `goSPA_run`) to obtain each PE's
    `fifo_b` + lane WSPs, counts APU-Stage-1 / Stage-2 / memory (§4), calls `perf_pe`
    per PE, and returns `pass_cycles = max(stage1, stage2, max_k pe_cycles, mem)` with a
-   per-PE breakdown (bottleneck, load-imbalance factor, lane utilization). `FILL`/
+   breakdown (bottleneck, load-imbalance factor, wall-clock `array_util`). `FILL`/
    `DRAIN` and the Cin / output-tile loops are deferred to `layer.py`. Validated by its
    own self-test (front-end cross-check, roofline, load-imbalance, `STAGE1_ENUM` knob).
 
@@ -271,7 +280,7 @@ Single-pass `N_PE×M` packing are **reused** from `functional.py`, not rebuilt h
    only, no logic.
 
 7. **`sim.py`** — top driver: run a workload through `layer` + `perf_model`, sum to
-   total cycles → latency/FPS, report lane utilization, per-PE load-imbalance factor,
+   total cycles → latency/FPS, report wall-clock `array_util`, per-PE load-imbalance factor,
    and **speedup vs. dense** (§8). AlexNet end-to-end with synthetic sparsity first,
    then wire in real sparsity.
 
@@ -316,10 +325,16 @@ cycles per run. The whole `F²` kernel is resident, so there is **no per-PID rel
 partial last cycle (the "tail"), so utilization is governed by average run length
 `≈ n_pairs/F²`, which is **independent of weight density**.
 
-**Key finding (synthetic phase-1).** `act` raises multiplier utilization exactly as
-predicted, but it is **not** a free win on wall-clock:
-- Utilization jumps (small 2-layer net: **0.49 → 0.96**; conv layers ~0.98).
-- But `act` re-streams the activation `M×` more (one front-end run per `N_PE`-channel
+**Key finding (synthetic phase-1).** `act` raises the *PE-intrinsic* lane utilization
+exactly as predicted, but it is **not** a free win on wall-clock:
+- The **PE-intrinsic** lane util (`perf_pe`'s `overall_lane_util`, union penalty gone)
+  jumps on the small 2-layer probe **0.49 → 0.96** (conv layers ~0.98). But this is a
+  per-PE ratio over `pe_cycles` — it assumes the PE is the bottleneck.
+- The **reported wall-clock `array_util`** does *not* follow it: because it normalizes by
+  `pass_cycles · N_PE · M`, the `M×` re-stream (below) and idle PEs pull it back down, so
+  `act` is roughly neutral vs `channel` on `3×3` and *worse* on `1×1`/FC. This is the
+  whole reason the aggregate metric uses wall-clock cycles rather than `pe_cycles`.
+- `act` re-streams the activation `M×` more (one front-end run per `N_PE`-channel
   tile), and with Stage 1 left un-widened at `n_nz`, the **front end becomes the
   bottleneck**. Total Stage-2 work is mode-invariant (the `M`-wide transfer cancels the
   `M×` passes), but total Stage-1 work is `M×` higher.

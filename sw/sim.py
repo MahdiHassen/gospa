@@ -4,7 +4,7 @@ goSPA performance model -- network-level simulation driver.
 Top driver (PERF_MODEL_PLAN.md sec.7/8/11.7). Runs a list of Layers through
 simulate_layer, sums to total cycles, and reports:
   - per-layer and total latency (ms) + FPS
-  - lane utilization and per-PE load-imbalance factor
+  - array utilization (wall-clock) and per-PE load-imbalance factor
   - speedup vs. dense baseline (headline vs. paper Table -- sec.8)
   - achieved vs. ideal MAC throughput
 
@@ -34,7 +34,7 @@ class NetworkStats:
     total_latency_ms: float
     fps: float
     speedup: float            # total_cycles_dense / total_cycles (1.0 if no baseline)
-    lane_util: float          # useful_macs / (pe_cycles * M) across all passes+layers
+    array_util: float         # useful_macs / (sum pass_cycles * N_PE * M) over layers
     load_imbalance: float     # mean per-layer load-imbalance factor
     achieved_macs_cycle: float   # useful_macs / total_wall_pass_cycles
     ideal_macs_cycle: int        # N_PE * M
@@ -47,7 +47,7 @@ class SweepPoint:
     total_cycles: int
     total_latency_ms: float
     fps: float
-    lane_util: float
+    array_util: float
     load_imbalance: float
     achieved_macs_cycle: float
     speedup_vs_dense: float = 0.0
@@ -89,9 +89,9 @@ def run_network(layers, cfg, *, seed=0, baseline=True, verbose=True):
             per_layer_dense.append(ds)
             if verbose:
                 spd = ds.layer_cycles / stats.layer_cycles
-                print(f"cycles={stats.layer_cycles:>12,}  util={stats.lane_util:.3f}  speedup={spd:.2f}x")
+                print(f"cycles={stats.layer_cycles:>12,}  util={stats.array_util:.3f}  speedup={spd:.2f}x")
         elif verbose:
-            print(f"cycles={stats.layer_cycles:>12,}  util={stats.lane_util:.3f}")
+            print(f"cycles={stats.layer_cycles:>12,}  util={stats.array_util:.3f}")
 
     total_cycles = sum(s.layer_cycles for s in per_layer)
     total_dense  = sum(s.layer_cycles for s in per_layer_dense) if baseline else 0
@@ -101,21 +101,19 @@ def run_network(layers, cfg, *, seed=0, baseline=True, verbose=True):
     fps = 1000.0 / total_latency_ms if total_latency_ms else 0.0
     speedup = total_dense / total_cycles if (baseline and total_cycles) else 1.0
 
-    # Utilization: sum useful MACs / sum (pe_cycles * M) across all layers+passes+PEs
+    # Array utilization over WALL-CLOCK: sum useful MACs / (the full physical
+    # array N_PE*M offered over every pass's pass_cycles). This charges the slots
+    # idled whenever the PE array is not the bottleneck (front-end/mem stalls,
+    # load imbalance, idle PEs) -- unlike a pe_cycles-only ratio. Equals
+    # achieved_macs_cycle / ideal below by construction.
     useful = sum(s.useful_macs
                  for ls in per_layer
                  for ps in ls.per_pass
                  for s  in ps.per_pe)
-    slots  = sum(s.pe_cycles * s.M
-                 for ls in per_layer
-                 for ps in ls.per_pass
-                 for s  in ps.per_pe)
-    lane_util = useful / slots if slots else 0.0
-
-    # Achieved throughput: useful MACs per wall-clock pass cycle
     wall_cycles = sum(ls.pass_cycles_total for ls in per_layer)
     ideal = cfg.N_PE * cfg.M
     achieved_macs_cycle = useful / wall_cycles if wall_cycles else 0.0
+    array_util = achieved_macs_cycle / ideal if ideal else 0.0
 
     imbalances = [ls.load_imbalance for ls in per_layer]
     load_imbalance = sum(imbalances) / len(imbalances) if imbalances else 1.0
@@ -128,7 +126,7 @@ def run_network(layers, cfg, *, seed=0, baseline=True, verbose=True):
         total_latency_ms=total_latency_ms,
         fps=fps,
         speedup=speedup,
-        lane_util=lane_util,
+        array_util=array_util,
         load_imbalance=load_imbalance,
         achieved_macs_cycle=achieved_macs_cycle,
         ideal_macs_cycle=ideal,
@@ -228,7 +226,7 @@ def run_sparsity_sweep(layers, cfg, activation_densities, weight_densities,
                 total_cycles=net.total_cycles,
                 total_latency_ms=net.total_latency_ms,
                 fps=net.fps,
-                lane_util=net.lane_util,
+                array_util=net.array_util,
                 load_imbalance=net.load_imbalance,
                 achieved_macs_cycle=net.achieved_macs_cycle,
                 speedup_vs_dense=speedup,
@@ -263,7 +261,7 @@ def print_sweep_report(sweep, layers, cfg):
                f"{point.weight_density:>6.2f}  "
                f"{1.0 - point.weight_density:>9.2f}  "
                f"{point.total_cycles:>12,}  {point.fps:>10.2f}  "
-               f"{point.lane_util:>6.3f}  "
+               f"{point.array_util:>6.3f}  "
                f"{point.load_imbalance:>6.3f}  "
                f"{point.achieved_macs_cycle:>8.2f}")
         if sweep.dense_cycles:
@@ -295,7 +293,7 @@ def print_report(net, layers, cfg):
         bk  = max(ls.bottleneck_hist, key=ls.bottleneck_hist.get) if ls.bottleneck_hist else "-"
         name = (layer.name or f"layer{i}")[:8]
         row = (f"{name:<8}  {ls.layer_cycles:>12,}  {lat:>8.3f}  "
-               f"{ls.lane_util:>6.3f}  {ls.load_imbalance:>6.3f}  {bk:>10}")
+               f"{ls.array_util:>6.3f}  {ls.load_imbalance:>6.3f}  {bk:>10}")
         if has_baseline:
             spd = net.per_layer_dense[i].layer_cycles / ls.layer_cycles
             row += f"  {spd:>6.2f}x"
@@ -303,7 +301,7 @@ def print_report(net, layers, cfg):
 
     print(sep)
     total_row = (f"{'TOTAL':<8}  {net.total_cycles:>12,}  {net.total_latency_ms:>8.3f}  "
-                 f"{net.lane_util:>6.3f}  {net.load_imbalance:>6.3f}  {'':>10}")
+                 f"{net.array_util:>6.3f}  {net.load_imbalance:>6.3f}  {'':>10}")
     if has_baseline:
         total_row += f"  {net.speedup:>6.2f}x"
     print(total_row)
@@ -312,7 +310,8 @@ def print_report(net, layers, cfg):
     print()
     print(f"FPS                  : {net.fps:.2f}")
     print(f"Achieved throughput  : {net.achieved_macs_cycle:.2f} MACs/cycle  "
-          f"(ideal {ideal}  ->  {net.achieved_macs_cycle / ideal * 100:.1f}% array efficiency)")
+          f"(ideal {ideal}  ->  {net.achieved_macs_cycle / ideal * 100:.1f}% array efficiency"
+          f"  == the Util column)")
     if has_baseline:
         print(f"Speedup vs dense     : {net.speedup:.2f}x")
         print(f"  paper target (AlexNet): 1.38x  -- gap explained by synthetic sparsity")

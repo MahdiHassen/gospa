@@ -85,7 +85,7 @@ class LayerStats:
     n_passes: int            # n_out_tiles * Cin (conv/1x1/fc) | n_out_tiles (dw)
     E: int                   # output spatial dimension (E x E feature map)
     per_pass: list = field(default_factory=list)   # list[PassStats]
-    lane_util: float = 0.0          # useful_macs / (pe_cycles * M) across all passes
+    array_util: float = 0.0         # useful_macs / (sum pass_cycles * N_PE * M)
     load_imbalance: float = 1.0     # mean per-pass load-imbalance factor
     bottleneck_hist: dict = field(default_factory=dict)   # stage -> pass count
     latency_ms: float = 0.0         # layer_cycles / FREQ_HZ * 1000
@@ -155,10 +155,14 @@ def simulate_layer(layer: Layer, cfg: HwConfig, seed: int = 0) -> LayerStats:
 
     layer_cycles = cfg.FILL + pass_cycles_total + out_store_cycles + cfg.DRAIN
 
-    # Aggregate utilization across all passes and PEs.
+    # Array utilization over wall-clock: useful MACs / (the full physical array
+    # N_PE*M offered over every pass's pass_cycles). Charges front-end/mem
+    # stalls, cross-PE load imbalance and idle PEs -- all the slots wasted when
+    # the PE array is not the bottleneck. FILL/DRAIN/out_store are excluded, so
+    # this is the compute-pass array efficiency (matches sim.py's achieved/ideal).
     useful = sum(s.useful_macs for ps in per_pass for s in ps.per_pe)
-    slots  = sum(s.pe_cycles * s.M for ps in per_pass for s in ps.per_pe)
-    lane_util = useful / slots if slots else 0.0
+    slots  = pass_cycles_total * cfg.N_PE * cfg.M
+    array_util = useful / slots if slots else 0.0
 
     imbalances = [ps.load_imbalance for ps in per_pass if ps.per_pe]
     load_imbalance = sum(imbalances) / len(imbalances) if imbalances else 1.0
@@ -179,10 +183,10 @@ def simulate_layer(layer: Layer, cfg: HwConfig, seed: int = 0) -> LayerStats:
         n_passes=len(per_pass),
         E=E,
         per_pass=per_pass,
-        lane_util=lane_util,
         load_imbalance=load_imbalance,
         bottleneck_hist=bottleneck_hist,
         latency_ms=latency_ms,
+        array_util=array_util,
     )
 
 
@@ -205,7 +209,7 @@ def _selftest():
                   type="conv", d_a=0.7, d_w=0.6)
     stats = simulate_layer(layer, cfg, seed=42)
     print(f"  conv: cycles={stats.layer_cycles} passes={stats.n_passes} "
-          f"tiles={stats.n_out_tiles} util={stats.lane_util:.3f} "
+          f"tiles={stats.n_out_tiles} util={stats.array_util:.3f} "
           f"imbalance={stats.load_imbalance:.3f}")
     check("n_out_tiles == ceil(Cout / (N_PE*M))",
           stats.n_out_tiles == ceil(layer.Cout / (cfg.N_PE * cfg.M)))
@@ -214,12 +218,13 @@ def _selftest():
     check("layer_cycles == FILL + pass_total + out_store + DRAIN",
           stats.layer_cycles == (cfg.FILL + stats.pass_cycles_total
                                   + stats.out_store_cycles + cfg.DRAIN))
-    check("lane_util in [0, 1]", 0.0 <= stats.lane_util <= 1.0)
+    check("array_util in [0, 1]", 0.0 <= stats.array_util <= 1.0)
     check("load_imbalance >= 1", stats.load_imbalance >= 1.0 - 1e-9)
     check("E == (H - F) // S + 1",
           stats.E == (layer.H - layer.F) // layer.S + 1)
 
-    # 2) Dense roofline: d_a=d_w=1, S=F -> lane_util == 1 (all lanes always busy).
+    # 2) Dense roofline: d_a=d_w=1, S=F, Cout=tile_size (array FULL) -> the
+    #    wall-clock array_util == 1 (every lane busy, pass PE-bound, no idle PEs).
     #    With S=F=2, each activation maps to exactly one (CID,PID) pair; all-ones
     #    kernels make union WSP all-1 so every activation is admitted and every
     #    lane fires at every entry.
@@ -227,8 +232,8 @@ def _selftest():
     layer_dense = Layer(H=4, W=4, F=2, S=2, pad=0, Cin=1, Cout=tile_size,
                         type="conv", d_a=1.0, d_w=1.0)
     stats_dense = simulate_layer(layer_dense, cfg, seed=0)
-    print(f"  dense roofline: util={stats_dense.lane_util:.3f}")
-    check("dense -> lane_util == 1.0", abs(stats_dense.lane_util - 1.0) < 1e-9)
+    print(f"  dense roofline: util={stats_dense.array_util:.3f}")
+    check("dense -> array_util == 1.0", abs(stats_dense.array_util - 1.0) < 1e-9)
 
     # 3) 1x1 conv: runs without error, pass count correct.
     layer_1x1 = Layer(H=7, W=7, F=1, S=1, pad=0, Cin=3, Cout=4,
@@ -262,24 +267,35 @@ def _selftest():
     check("bottleneck_hist sums to n_passes",
           sum(stats.bottleneck_hist.values()) == stats.n_passes)
 
-    # 8) act arch: one kernel/PE tiling (M x more tiles); util is decoupled from
-    #    weight density, so on a weight-sparse conv it beats channel arch.
+    # 8) act arch: one kernel/PE tiling (M x more tiles). On the wall-clock
+    #    array_util the M x re-stream against an un-widened Stage 1 shows up as
+    #    idle PE-slots, so act does NOT beat channel on total-cycle utilization
+    #    even though its PE-intrinsic lane util is higher (union penalty gone).
+    #    This is exactly the effect the PE-cycle-only metric used to hide.
     cfg_ch = HwConfig(N_PE=4, M=2, FILL=0, DRAIN=0, ARCH="channel")
     cfg_ac = HwConfig(N_PE=4, M=2, FILL=0, DRAIN=0, ARCH="act")
     lyr = Layer(H=10, W=10, F=3, S=1, pad=0, Cin=2, Cout=16,
                 type="conv", d_a=0.8, d_w=0.4)
     st_ch = simulate_layer(lyr, cfg_ch, seed=7)
     st_ac = simulate_layer(lyr, cfg_ac, seed=7)
-    print(f"  arch: ch tiles={st_ch.n_out_tiles} util={st_ch.lane_util:.3f} | "
-          f"act tiles={st_ac.n_out_tiles} util={st_ac.lane_util:.3f}")
+    print(f"  arch: ch tiles={st_ch.n_out_tiles} util={st_ch.array_util:.3f} "
+          f"cyc={st_ch.pass_cycles_total} | "
+          f"act tiles={st_ac.n_out_tiles} util={st_ac.array_util:.3f} "
+          f"cyc={st_ac.pass_cycles_total}")
     check("act n_out_tiles == ceil(Cout / N_PE)",
           st_ac.n_out_tiles == ceil(lyr.Cout / cfg_ac.N_PE))
     check("act has M x channel's tiles",
           st_ac.n_out_tiles == cfg_ac.M * st_ch.n_out_tiles)
     check("act n_passes == n_out_tiles * Cin",
           st_ac.n_passes == st_ac.n_out_tiles * lyr.Cin)
-    check("act util > channel util (sparse weights)",
-          st_ac.lane_util > st_ch.lane_util)
+    check("both array_util in [0,1]",
+          0.0 <= st_ac.array_util <= 1.0 and 0.0 <= st_ch.array_util <= 1.0)
+    # On a 3x3 conv the two arches are ~neutral in wall-clock: act's PE-intrinsic
+    # utilization edge (union penalty gone) is cancelled by its M x re-stream
+    # against an un-widened Stage 1. The PE-cycle-only metric used to report act
+    # as the clear winner here; array_util correctly shows the tie.
+    check("act no longer beats channel on wall-clock util (3x3 ~neutral)",
+          abs(st_ac.array_util - st_ch.array_util) < 0.05)
 
     print(f"\nlayer self-test: {'PASS' if ok else 'FAIL'}")
     return ok

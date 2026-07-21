@@ -64,7 +64,7 @@ class PassStats:
     per_pe: list = field(default_factory=list)   # PEStats per PE
     slowest_pe: int = -1
     load_imbalance: float = 1.0   # max_k pe_cycles / mean_k pe_cycles
-    lane_util: float = 0.0        # Sum useful_macs / Sum (pe_cycles * M)
+    array_util: float = 0.0       # useful_macs / (pass_cycles * N_PE * M)
     n_nz: int = 0
     n_pairs: int = 0
 
@@ -151,17 +151,25 @@ def score_pass(routed, cfg):
         slowest = max(range(len(per_pe)), key=lambda i: per_pe[i].pe_cycles)
         mean_pe = sum(pe_cycles) / len(pe_cycles)
         load_imbalance = pe_stage / mean_pe if mean_pe else 1.0
-        useful = sum(s.useful_macs for s in per_pe)
-        slots = sum(s.pe_cycles * s.M for s in per_pe)
-        lane_util = useful / slots if slots else 0.0
     else:
-        slowest, load_imbalance, lane_util = -1, 1.0, 0.0
+        slowest, load_imbalance = -1, 1.0
+
+    # Array utilization over WALL-CLOCK: fraction of the full physical array's
+    # multiply-slots (pass_cycles * N_PE * M) that did useful work. Because the
+    # denominator is pass_cycles -- not each PE's own pe_cycles -- it charges
+    # every slot idled when the PE is NOT the bottleneck: front-end/mem stall
+    # (pass_cycles > pe_stage), cross-PE load imbalance, and PEs left idle on a
+    # partial tile (fewer than N_PE active). It collapses back to the old
+    # PE-intrinsic ratio only when the pass is PE-bound, balanced, and full.
+    useful = sum(s.useful_macs for s in per_pe)
+    slots = pass_cycles * cfg.N_PE * cfg.M
+    array_util = useful / slots if slots else 0.0
 
     return PassStats(
         pass_cycles=pass_cycles, stage1_cycles=stage1, stage2_cycles=stage2,
         pe_stage_cycles=pe_stage, mem_cycles=mem, bottleneck=bottleneck,
         per_pe=per_pe, slowest_pe=slowest, load_imbalance=load_imbalance,
-        lane_util=lane_util, n_nz=routed.n_nz, n_pairs=routed.n_pairs,
+        array_util=array_util, n_nz=routed.n_nz, n_pairs=routed.n_pairs,
     )
 
 
@@ -201,7 +209,7 @@ def _selftest():
     ps = run_pass(act, kernels, 1, cfg)
     print(f"  case1: {ps.bottleneck} pass={ps.pass_cycles} "
           f"s1={ps.stage1_cycles} s2={ps.stage2_cycles} "
-          f"pe={ps.pe_stage_cycles} mem={ps.mem_cycles} util={ps.lane_util:.3f}")
+          f"pe={ps.pe_stage_cycles} mem={ps.mem_cycles} util={ps.array_util:.3f}")
 
     check("stage2 == n_pairs", ps.stage2_cycles == r.n_pairs)
     check("single PE holds all 3 kernels",
@@ -218,18 +226,29 @@ def _selftest():
           {"stage1": ps.stage1_cycles, "stage2": ps.stage2_cycles,
            "pe": ps.pe_stage_cycles, "mem": ps.mem_cycles}[ps.bottleneck]
           == ps.pass_cycles)
-    check("lane_util in [0,1]", 0.0 <= ps.lane_util <= 1.0)
+    check("array_util in [0,1]", 0.0 <= ps.array_util <= 1.0)
+    # The wall-clock array_util can never exceed the old PE-intrinsic ratio
+    # (useful / sum pe_cycles*M): pass_cycles*N_PE >= sum_k pe_cycles_k always,
+    # so charging front-end/imbalance/idle-PE slots only lowers it. This is the
+    # whole point of the metric -- it stops assuming the PE is the bottleneck.
+    pe_only = (sum(s.useful_macs for s in ps.per_pe)
+               / sum(s.pe_cycles * s.M for s in ps.per_pe))
+    check("array_util <= PE-intrinsic util", ps.array_util <= pe_only + 1e-9)
     check("single PE -> imbalance == 1", abs(ps.load_imbalance - 1.0) < 1e-9)
 
-    # 2) Roofline: dense activation, all-ones kernel, S=F (no window overlap).
-    #    -> n_pairs == n_nz and the single lane is fully utilized.
+    # 2) Roofline: dense activation, all-ones kernels, S=F (no window overlap),
+    #    and a tile sized to FILL the array (N_PE*M kernels). Every lane fires
+    #    every cycle and the pass is PE-bound, so the wall-clock array_util
+    #    (full physical array in the denominator) reaches 1.0.
     dense = [[1, 1, 1, 1], [1, 1, 1, 1], [1, 1, 1, 1], [1, 1, 1, 1]]
-    ones = [[[1, 1], [1, 1]]]
-    r2 = fn.goSPA_route(dense, ones, 2, num_pes=cfg.N_PE, num_mults=cfg.M,
+    cfg_rl = HwConfig(N_PE=2, M=2)
+    ones = [[[1, 1], [1, 1]] for _ in range(cfg_rl.N_PE * cfg_rl.M)]
+    r2 = fn.goSPA_route(dense, ones, 2, num_pes=cfg_rl.N_PE, num_mults=cfg_rl.M,
                         interpretation="v2")
-    ps2 = run_pass(dense, ones, 2, cfg)
+    ps2 = run_pass(dense, ones, 2, cfg_rl)
     check("roofline n_pairs == n_nz", r2.n_pairs == r2.n_nz)
-    check("roofline lane_util == 1", abs(ps2.lane_util - 1.0) < 1e-9)
+    check("roofline pass is PE-bound", ps2.pass_cycles == ps2.pe_stage_cycles)
+    check("roofline array_util == 1", abs(ps2.array_util - 1.0) < 1e-9)
 
     # 3) Load imbalance: one dense kernel vs one near-empty kernel, one kernel
     #    per PE (M=1) -> two PEs with very different FIFO-B depths.
@@ -265,17 +284,16 @@ def _selftest():
                            interpretation="v1")
     ps_act = run_pass(big, ksparse, 1, cfg_act)
     ps_ch = run_pass(big, ksparse, 1, cfg_ch)
-    print(f"  arch cmp: act util={ps_act.lane_util:.3f} "
-          f"ch util={ps_ch.lane_util:.3f} | "
+    print(f"  arch cmp: act util={ps_act.array_util:.3f} "
+          f"ch util={ps_ch.array_util:.3f} | "
           f"act(s2={ps_act.stage2_cycles} pe={ps_act.pe_stage_cycles}) "
           f"ch(s2={ps_ch.stage2_cycles} pe={ps_ch.pe_stage_cycles})")
     check("act stage2 == ceil(n_pairs / M)",
           ps_act.stage2_cycles == ceil(r_act.n_pairs / 4))
     check("act one kernel per PE", len(ps_act.per_pe) == len(ksparse))
     check("act no PE reloads", all(s.num_reloads == 0 for s in ps_act.per_pe))
-    check("act lane_util in [0,1]", 0.0 <= ps_act.lane_util <= 1.0)
-    check("act util > channel util (sparse weights)",
-          ps_act.lane_util > ps_ch.lane_util)
+    check("act array_util in [0,1]", 0.0 <= ps_act.array_util <= 1.0)
+    check("ch array_util in [0,1]", 0.0 <= ps_ch.array_util <= 1.0)
 
     print(f"\nperf_model self-test: {'PASS' if ok else 'FAIL'}")
     return ok
