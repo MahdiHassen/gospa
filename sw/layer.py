@@ -13,7 +13,7 @@ PyTorch-captured maps slot in without changing this module's interface.
 """
 
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import ceil
 
 from config import HwConfig
@@ -89,6 +89,11 @@ class LayerStats:
     load_imbalance: float = 1.0     # mean per-pass load-imbalance factor
     bottleneck_hist: dict = field(default_factory=dict)   # stage -> pass count
     latency_ms: float = 0.0         # layer_cycles / FREQ_HZ * 1000
+    stage2_batch: int = 1           # router width B used by every pass
+    stage2_batch_star: int = 1      # max over passes of B* -- the narrowest
+                                    # router that would stop binding ANYWHERE
+                                    # in this layer (recorded even when B is
+                                    # pinned, so headroom stays visible)
 
 
 # ---------------------------------------------------------------------------
@@ -147,12 +152,17 @@ def simulate_layer(layer: Layer, cfg: HwConfig, seed: int = 0) -> LayerStats:
                                 for _ in range(n_oc)]
                 per_pass.append(pm.run_pass(act, kernels_tile, layer.S, cfg))
 
-    pass_cycles_total = sum(ps.pass_cycles for ps in per_pass)
-
     # Output writeback: resident accumulators -> memory, charged once per layer.
     out_bytes = layer.Cout * E * E * cfg.BYTES_OUT
     out_store_cycles = ceil(out_bytes / max(1, cfg.MEM_BW_BYTES)) + cfg.MEM_LATENCY
 
+    return _aggregate(per_pass, cfg, out_store_cycles, n_out_tiles, E)
+
+
+def _aggregate(per_pass, cfg, out_store_cycles, n_out_tiles, E) -> LayerStats:
+    """Roll a scored pass list up into LayerStats. Shared by simulate_layer and
+    rescore_layer_at_batch so the two can never drift apart."""
+    pass_cycles_total = sum(ps.pass_cycles for ps in per_pass)
     layer_cycles = cfg.FILL + pass_cycles_total + out_store_cycles + cfg.DRAIN
 
     # Array utilization over wall-clock: useful MACs / (the full physical array
@@ -187,7 +197,21 @@ def simulate_layer(layer: Layer, cfg: HwConfig, seed: int = 0) -> LayerStats:
         bottleneck_hist=bottleneck_hist,
         latency_ms=latency_ms,
         array_util=array_util,
+        stage2_batch=max((ps.stage2_batch for ps in per_pass), default=1),
+        stage2_batch_star=max((ps.stage2_batch_star for ps in per_pass),
+                              default=1),
     )
+
+
+def rescore_layer_at_batch(ls: LayerStats, cfg: HwConfig, B: int) -> LayerStats:
+    """Re-derive a whole layer at router width B, with no re-simulation.
+
+    Only Stage 2 depends on B, and every other stage counter is already stored
+    per pass, so this is pure arithmetic over `ls.per_pass`. This is what lets
+    sim.py resolve a network-wide "auto" width: simulate once, then re-derive
+    every layer at the single chosen B."""
+    per_pass = [pm.rescore_at_batch(ps, cfg, B) for ps in ls.per_pass]
+    return _aggregate(per_pass, cfg, ls.out_store_cycles, ls.n_out_tiles, ls.E)
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +320,33 @@ def _selftest():
     # as the clear winner here; array_util correctly shows the tie.
     check("act no longer beats channel on wall-clock util (3x3 ~neutral)",
           abs(st_ac.array_util - st_ch.array_util) < 0.05)
+
+    # 9) Router-width knob at layer scope.
+    lyr9 = Layer(name="c9", H=13, W=13, F=3, S=1, pad=1, Cin=2, Cout=16,
+                 type="conv", d_a=0.5, d_w=0.4)
+    cfg9 = HwConfig(N_PE=8, M=4, ARCH="act", STAGE2_BATCH="native")
+    st9 = simulate_layer(lyr9, cfg9, seed=0)
+    Bstar = st9.stage2_batch_star
+    check("layer B* == max over passes",
+          Bstar == max(ps.stage2_batch_star for ps in st9.per_pass))
+    check("layer B* >= native B", Bstar >= st9.stage2_batch)
+
+    # rescore_layer_at_batch must agree with a full re-simulation at the same B.
+    re9 = rescore_layer_at_batch(st9, cfg9, Bstar)
+    sim9 = simulate_layer(lyr9, replace(cfg9, STAGE2_BATCH=Bstar), seed=0)
+    check("rescore_layer_at_batch == simulate_layer at same B",
+          re9.pass_cycles_total == sim9.pass_cycles_total
+          and re9.layer_cycles == sim9.layer_cycles
+          and abs(re9.array_util - sim9.array_util) < 1e-12
+          and re9.bottleneck_hist == sim9.bottleneck_hist)
+    # Widening to the layer-wide B* must not leave any pass Stage-2-bound.
+    check("no pass stage2-bound at layer B*",
+          "stage2" not in re9.bottleneck_hist)
+    check("widening cannot slow the layer",
+          re9.pass_cycles_total <= st9.pass_cycles_total)
+    check("native default unchanged by the refactor",
+          simulate_layer(lyr9, HwConfig(N_PE=8, M=4, ARCH="act"), seed=0)
+          .pass_cycles_total == st9.pass_cycles_total)
 
     print(f"\nlayer self-test: {'PASS' if ok else 'FAIL'}")
     return ok

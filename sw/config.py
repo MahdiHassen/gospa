@@ -55,6 +55,24 @@ class HwConfig:
     # "serial":   stage1 = n_nz + n_pairs       serial emit (pessimistic knob)
     STAGE1_ENUM: str = "parallel"
 
+    # --- APU Stage 2 router width ----------------------------------------
+    # B = FIFO-A heads the router pops per cycle, so stage2 = ceil(n_pairs / B).
+    # "native": as-built -- B = M in "act" (the FIFO-A -> FIFO-B transfer is
+    #           widened to M activations/cycle) and B = 1 in "channel" (the
+    #           router drains one entry/cycle and fans it out). This is the
+    #           default: it reproduces the RTL, where routing.sv pops exactly
+    #           one head per cycle (`go = head_valid && all_ready`).
+    # int:      a fixed router width, e.g. 12.
+    # "auto":   B = B*, the knee -- the narrowest router that stops being the
+    #           bottleneck. Scope is the WHOLE NETWORK (one fixed width for
+    #           every layer), taken as the max of the per-pass B* over all
+    #           passes of all layers; sim.py resolves it. Below layer scope
+    #           there is no network to max over, so simulate_layer/score_pass
+    #           fall back to per-pass B*. See stage2_batch_star in PassStats.
+    # NOTE: "auto" is an ANALYSIS knob -- it answers "how wide would the router
+    # have to be", not "how wide is it". It changes every reported number.
+    STAGE2_BATCH: Union[int, str] = "native"
+
     # --- memory (fixed-latency + bandwidth; the calibration target) ------
     MEM_BW_BYTES: int = 16        # B: bytes moved per cycle
     MEM_LATENCY: int = 0          # L: fixed access latency in cycles

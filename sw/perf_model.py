@@ -22,7 +22,7 @@ dataflow is chosen by HwConfig.ARCH; all hardware parameters arrive via HwConfig
 (config.py). See PERF_MODEL_PLAN.md sec.3/4/5/11.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import ceil
 
 import functional as fn
@@ -67,6 +67,9 @@ class PassStats:
     array_util: float = 0.0       # useful_macs / (pass_cycles * N_PE * M)
     n_nz: int = 0
     n_pairs: int = 0
+    stage2_batch: int = 1         # B actually used: stage2 = ceil(n_pairs / B)
+    stage2_batch_star: int = 1    # B*, the knee -- always recorded, even when
+                                  # B is pinned, so the headroom stays visible
 
 
 # ---------------------------------------------------------------------------
@@ -109,23 +112,83 @@ def _mem_cycles(routed, cfg):
 # Pass scoring
 # ---------------------------------------------------------------------------
 
+def native_batch(cfg):
+    """B for STAGE2_BATCH="native" -- the as-built router width.
+
+    "act": the FIFO-A -> FIFO-B transfer is widened to M activations/cycle, so
+    Stage 2 drains M pairs/cycle. "channel": the router drains one FIFO-A entry
+    per cycle and fans it out to every PE in parallel, so B = 1."""
+    return max(1, cfg.M) if cfg.ARCH == "act" else 1
+
+
+def batch_star(n_pairs, stage1, pe_stage, mem):
+    """B*, the knee: the narrowest router that stops being the bottleneck.
+
+    stage2 = ceil(n_pairs / B) is the ONLY stage that depends on B -- widening
+    the router does not change how fast a PE chews its FIFO-B (pe_stage), how
+    many activations Stage 1 enumerates, or the memory traffic. So the smallest
+    B with ceil(n_pairs / B) <= max(stage1, pe_stage, mem) is exactly the point
+    past which widening buys nothing, and it is computable in one shot with no
+    circular dependency.
+
+    This is the general form of the M/d_w law: for "act" at large F the binding
+    stage is the PE and B* -> M/d_w, but on small kernels Stage 1 (n_nz, one
+    activation/cycle) takes over first and B* stops short of it."""
+    other = max(stage1, pe_stage, mem)
+    return max(1, ceil(n_pairs / other)) if other else 1
+
+
+def resolve_batch(cfg, n_pairs, stage1, pe_stage, mem):
+    """Turn cfg.STAGE2_BATCH into a concrete (B, B*) pair.
+
+    "auto" resolves to the PER-PASS B* here. Network-wide "auto" -- one fixed
+    width for every layer -- is resolved by sim.run_network, which maxes B*
+    over all passes and then re-scores via rescore_at_batch; at pass scope
+    there is no network to max over."""
+    star = batch_star(n_pairs, stage1, pe_stage, mem)
+    spec = cfg.STAGE2_BATCH
+    if spec == "native":
+        return native_batch(cfg), star
+    if spec == "auto":
+        return star, star
+    if isinstance(spec, int) and spec >= 1:
+        return spec, star
+    raise ValueError(f"bad STAGE2_BATCH {spec!r}: want 'native', 'auto', or int >= 1")
+
+
+def rescore_at_batch(ps, cfg, B):
+    """Re-derive (pass_cycles, bottleneck, array_util) at router width B.
+
+    Pure recomputation from counters already in `ps` -- no re-routing, no
+    functional re-run. Valid because stage1/pe_stage/mem are all independent of
+    B, so only stage2 moves. This is what makes network-wide "auto" cheap: the
+    expensive functional sim runs once, then every pass is re-derived at the
+    single chosen width."""
+    stage2 = ceil(ps.n_pairs / B) if ps.n_pairs else 0
+    stages = {"stage1": ps.stage1_cycles, "stage2": stage2,
+              "pe": ps.pe_stage_cycles, "mem": ps.mem_cycles}
+    bottleneck = max(stages, key=stages.get)
+    pass_cycles = stages[bottleneck]
+    useful = sum(s.useful_macs for s in ps.per_pe)
+    slots = pass_cycles * cfg.N_PE * cfg.M
+    return replace(ps, pass_cycles=pass_cycles, stage2_cycles=stage2,
+                   bottleneck=bottleneck, stage2_batch=B,
+                   array_util=useful / slots if slots else 0.0)
+
+
 def score_pass(routed, cfg):
     """Score one already-routed pass. Pure: no functional re-run, no I/O."""
     stage1 = _stage1_cycles(routed, cfg)
 
     if cfg.ARCH == "act":
-        # One kernel/PE shared by M multipliers. The FIFO-A -> FIFO-B transfer
-        # is widened to M activations/cycle, so Stage 2 drains at M pairs/cycle.
-        # pe_lane_wsps[k] is a single-element list (one WSP) under v1 routing.
-        stage2 = ceil(routed.n_pairs / max(1, cfg.M))
+        # One kernel/PE shared by M multipliers. pe_lane_wsps[k] is a
+        # single-element list (one WSP) under v1 routing.
         per_pe = [
             pe_perf_actparallel(fb, routed.pe_lane_wsps[k][0], cfg.M)
             for k, fb in enumerate(routed.fifo_b_list)
         ]
     elif cfg.ARCH == "channel":
-        # M kernels/PE, one activation broadcast to M lanes; the router drains
-        # one FIFO-A entry/cycle and fans it out to all PEs in parallel.
-        stage2 = routed.n_pairs
+        # M kernels/PE, one activation broadcast to M lanes.
         per_pe = [
             pe_perf_from_stream(
                 fb, routed.pe_lane_wsps[k],
@@ -142,6 +205,11 @@ def score_pass(routed, cfg):
     pe_stage = max(pe_cycles) if pe_cycles else 0
 
     mem = _mem_cycles(routed, cfg)
+
+    # Stage 2 is the one stage that depends on the router width, so it is
+    # counted last: B* is read off the stages that do not.
+    B, B_star = resolve_batch(cfg, routed.n_pairs, stage1, pe_stage, mem)
+    stage2 = ceil(routed.n_pairs / B) if routed.n_pairs else 0
 
     stages = {"stage1": stage1, "stage2": stage2, "pe": pe_stage, "mem": mem}
     bottleneck = max(stages, key=stages.get)
@@ -170,6 +238,7 @@ def score_pass(routed, cfg):
         pe_stage_cycles=pe_stage, mem_cycles=mem, bottleneck=bottleneck,
         per_pe=per_pe, slowest_pe=slowest, load_imbalance=load_imbalance,
         array_util=array_util, n_nz=routed.n_nz, n_pairs=routed.n_pairs,
+        stage2_batch=B, stage2_batch_star=B_star,
     )
 
 
@@ -191,6 +260,14 @@ def run_pass(activation, kernels_tile, stride, cfg, *, interpretation=None):
 # Self-test (front-end cross-check + the sec.9 invariants)
 # ---------------------------------------------------------------------------
 
+def _raises(fn_):
+    try:
+        fn_()
+    except ValueError:
+        return True
+    return False
+
+
 def _selftest():
     ok = True
 
@@ -199,7 +276,9 @@ def _selftest():
         ok = ok and cond
         print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
 
-    cfg = HwConfig(N_PE=8, M=4)
+    # STAGE2_BATCH pinned to the as-built width: cases 1-6 assert the native
+    # Stage-2 formula, so they must not follow a future change of the default.
+    cfg = HwConfig(N_PE=8, M=4, STAGE2_BATCH="native")
 
     # 1) Functional v2 case: 4x4 activation, three 2x2 kernels in one PE.
     act = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]
@@ -278,8 +357,8 @@ def _selftest():
     #    no PE reloads, and lane util beats channel arch (union penalty gone).
     big = [[((i * 7 + j) % 5) for j in range(8)] for i in range(8)]   # ~sparse act
     ksparse = [[[1, 0], [0, 0]], [[0, 1], [0, 0]], [[1, 0], [0, 1]]]  # sparse wgts
-    cfg_act = HwConfig(N_PE=8, M=4, ARCH="act")
-    cfg_ch = HwConfig(N_PE=8, M=4, ARCH="channel")
+    cfg_act = HwConfig(N_PE=8, M=4, ARCH="act", STAGE2_BATCH="native")
+    cfg_ch = HwConfig(N_PE=8, M=4, ARCH="channel", STAGE2_BATCH="native")
     r_act = fn.goSPA_route(big, ksparse, 1, num_pes=8, num_mults=4,
                            interpretation="v1")
     ps_act = run_pass(big, ksparse, 1, cfg_act)
@@ -294,6 +373,62 @@ def _selftest():
     check("act no PE reloads", all(s.num_reloads == 0 for s in ps_act.per_pe))
     check("act array_util in [0,1]", 0.0 <= ps_act.array_util <= 1.0)
     check("ch array_util in [0,1]", 0.0 <= ps_ch.array_util <= 1.0)
+
+    # 7) STAGE2_BATCH knob.
+    check("native act B == M", native_batch(cfg_act) == 4)
+    check("native channel B == 1", native_batch(cfg_ch) == 1)
+    check("native default preserved", HwConfig().STAGE2_BATCH == "native")
+
+    # B=native is just B=1 spelled differently in "channel".
+    ps_b1 = run_pass(big, ksparse, 1, HwConfig(N_PE=8, M=4, ARCH="channel",
+                                               STAGE2_BATCH=1))
+    check("channel B=1 == native", ps_b1.pass_cycles == ps_ch.pass_cycles)
+
+    # Widening the router can only shorten a pass, never lengthen it.
+    prev, mono = None, True
+    for B in (1, 2, 4, 8, 16, 32, 64):
+        c = run_pass(big, ksparse, 1,
+                     HwConfig(N_PE=8, M=4, ARCH="act", STAGE2_BATCH=B))
+        mono = mono and (prev is None or c.pass_cycles <= prev)
+        prev = c.pass_cycles
+    check("pass_cycles non-increasing in B", mono)
+
+    # B* is the knee: at B* Stage 2 has stopped binding, and going far past it
+    # changes nothing.
+    ps_auto = run_pass(big, ksparse, 1, HwConfig(N_PE=8, M=4, ARCH="act",
+                                                 STAGE2_BATCH="auto"))
+    star = ps_auto.stage2_batch_star
+    check("auto uses B*", ps_auto.stage2_batch == star)
+    check("auto is not stage2-bound", ps_auto.bottleneck != "stage2")
+    ps_wide = run_pass(big, ksparse, 1, HwConfig(N_PE=8, M=4, ARCH="act",
+                                                 STAGE2_BATCH=star * 10))
+    check("B* saturates (10x B* is no faster)",
+          ps_wide.pass_cycles == ps_auto.pass_cycles)
+    check("B* is minimal (B*-1 is strictly slower or B*==1)",
+          star == 1 or run_pass(big, ksparse, 1,
+                                HwConfig(N_PE=8, M=4, ARCH="act",
+                                         STAGE2_BATCH=star - 1)
+                                ).pass_cycles > ps_auto.pass_cycles)
+
+    # B* is recorded even when B is pinned, so headroom stays visible.
+    check("B* recorded under native", ps_act.stage2_batch_star >= 1)
+
+    # rescore_at_batch must reproduce a real run at the same width.
+    re_b = rescore_at_batch(ps_act, cfg_act, star)
+    check("rescore_at_batch == run_pass at same B",
+          re_b.pass_cycles == ps_auto.pass_cycles
+          and abs(re_b.array_util - ps_auto.array_util) < 1e-12
+          and re_b.bottleneck == ps_auto.bottleneck)
+
+    # The cap we derived: in "act", useful = N_PE*d_w*n_pairs while Stage 2
+    # needs >= n_pairs/M cycles, so native array_util <= d_w regardless of
+    # which stage actually binds. Here d_w = 4/16 nonzero weights per kernel.
+    d_w = sum(sum(row) for k in ksparse for row in k) / (len(ksparse) * 4)
+    check("native act array_util <= d_w", ps_act.array_util <= d_w + 1e-9)
+
+    check("bad STAGE2_BATCH rejected",
+          _raises(lambda: run_pass(big, ksparse, 1,
+                                   HwConfig(ARCH="act", STAGE2_BATCH=0))))
 
     print(f"\nperf_model self-test: {'PASS' if ok else 'FAIL'}")
     return ok

@@ -18,7 +18,8 @@ import os
 from dataclasses import dataclass, replace
 
 from config import HwConfig
-from layer import Layer, LayerStats, simulate_layer
+from layer import Layer, LayerStats, simulate_layer, rescore_layer_at_batch
+from perf_model import native_batch
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +39,10 @@ class NetworkStats:
     load_imbalance: float     # mean per-layer load-imbalance factor
     achieved_macs_cycle: float   # useful_macs / total_wall_pass_cycles
     ideal_macs_cycle: int        # N_PE * M
+    stage2_batch: int = 1        # the ONE router width every layer ran at
+    stage2_batch_star: int = 1   # max over all passes of all layers of B* --
+                                 # the width that would stop Stage 2 binding
+                                 # anywhere in the network
 
 
 @dataclass
@@ -76,22 +81,54 @@ def run_network(layers, cfg, *, seed=0, baseline=True, verbose=True):
     per_layer = []
     per_layer_dense = []
 
+    # STAGE2_BATCH="auto" is resolved at NETWORK scope: one router width shared
+    # by every layer, because that is what fixed-width hardware is. B* itself
+    # does not depend on B (only Stage 2 does), so phase 1 can run at the
+    # as-built width -- that makes the per-layer progress lines the "before"
+    # picture -- and phase 2 re-derives everything at the resolved width.
+    auto = cfg.STAGE2_BATCH == "auto"
+    cfg_run = replace(cfg, STAGE2_BATCH="native") if auto else cfg
+
     for i, layer in enumerate(layers):
         label = (layer.name or f"layer{i}")
         if verbose:
             print(f"  [{i+1}/{len(layers)}] {label:<8}", end=" ", flush=True)
 
-        stats = simulate_layer(layer, cfg, seed=seed + i)
+        stats = simulate_layer(layer, cfg_run, seed=seed + i)
         per_layer.append(stats)
 
         if baseline:
-            ds = simulate_layer(replace(layer, d_a=1.0, d_w=1.0), cfg, seed=seed + i)
+            ds = simulate_layer(replace(layer, d_a=1.0, d_w=1.0), cfg_run,
+                                seed=seed + i)
             per_layer_dense.append(ds)
             if verbose:
                 spd = ds.layer_cycles / stats.layer_cycles
                 print(f"cycles={stats.layer_cycles:>12,}  util={stats.array_util:.3f}  speedup={spd:.2f}x")
         elif verbose:
             print(f"cycles={stats.layer_cycles:>12,}  util={stats.array_util:.3f}")
+
+    # B* is the max over every pass of every layer: the narrowest single router
+    # that stops binding ANYWHERE in the network. Recorded even when B is
+    # pinned, so the headroom is always visible in the report.
+    batch_star = max((ls.stage2_batch_star for ls in per_layer), default=1)
+
+    if auto:
+        # One width for the whole network. The dense baseline is re-derived at
+        # the SAME width -- it is the same hardware, so the speedup stays an
+        # apples-to-apples data comparison rather than a hardware comparison.
+        before = sum(ls.pass_cycles_total for ls in per_layer)
+        per_layer = [rescore_layer_at_batch(ls, cfg, batch_star)
+                     for ls in per_layer]
+        per_layer_dense = [rescore_layer_at_batch(ls, cfg, batch_star)
+                           for ls in per_layer_dense]
+        if verbose:
+            after = sum(ls.pass_cycles_total for ls in per_layer)
+            print(f"  auto: network-wide B = max B* = {batch_star} "
+                  f"(native {native_batch(cfg)}); compute cycles "
+                  f"{before:,} -> {after:,}")
+        batch_used = batch_star
+    else:
+        batch_used = max((ls.stage2_batch for ls in per_layer), default=1)
 
     total_cycles = sum(s.layer_cycles for s in per_layer)
     total_dense  = sum(s.layer_cycles for s in per_layer_dense) if baseline else 0
@@ -130,6 +167,8 @@ def run_network(layers, cfg, *, seed=0, baseline=True, verbose=True):
         load_imbalance=load_imbalance,
         achieved_macs_cycle=achieved_macs_cycle,
         ideal_macs_cycle=ideal,
+        stage2_batch=batch_used,
+        stage2_batch_star=batch_star,
     )
 
 
@@ -279,7 +318,8 @@ def print_report(net, layers, cfg):
     freq = max(1.0, cfg.FREQ_HZ)
     ideal = cfg.N_PE * cfg.M
 
-    col = f"{'Layer':<8}  {'Cycles':>12}  {'Lat(ms)':>8}  {'Util':>6}  {'Imbal':>6}  {'Bottleneck':>10}"
+    col = (f"{'Layer':<8}  {'Cycles':>12}  {'Lat(ms)':>8}  {'Util':>6}  "
+           f"{'Imbal':>6}  {'Bottleneck':>10}  {'B*':>4}")
     if has_baseline:
         col += f"  {'Speedup':>7}"
     sep = "-" * len(col)
@@ -293,7 +333,8 @@ def print_report(net, layers, cfg):
         bk  = max(ls.bottleneck_hist, key=ls.bottleneck_hist.get) if ls.bottleneck_hist else "-"
         name = (layer.name or f"layer{i}")[:8]
         row = (f"{name:<8}  {ls.layer_cycles:>12,}  {lat:>8.3f}  "
-               f"{ls.array_util:>6.3f}  {ls.load_imbalance:>6.3f}  {bk:>10}")
+               f"{ls.array_util:>6.3f}  {ls.load_imbalance:>6.3f}  {bk:>10}  "
+               f"{ls.stage2_batch_star:>4}")
         if has_baseline:
             spd = net.per_layer_dense[i].layer_cycles / ls.layer_cycles
             row += f"  {spd:>6.2f}x"
@@ -301,7 +342,8 @@ def print_report(net, layers, cfg):
 
     print(sep)
     total_row = (f"{'TOTAL':<8}  {net.total_cycles:>12,}  {net.total_latency_ms:>8.3f}  "
-                 f"{net.array_util:>6.3f}  {net.load_imbalance:>6.3f}  {'':>10}")
+                 f"{net.array_util:>6.3f}  {net.load_imbalance:>6.3f}  {'':>10}  "
+                 f"{net.stage2_batch_star:>4}")
     if has_baseline:
         total_row += f"  {net.speedup:>6.2f}x"
     print(total_row)
@@ -309,6 +351,11 @@ def print_report(net, layers, cfg):
 
     print()
     print(f"FPS                  : {net.fps:.2f}")
+    print(f"Stage-2 router width : B = {net.stage2_batch}"
+          f"  ({'auto -> network-wide max B*' if cfg.STAGE2_BATCH == 'auto' else cfg.STAGE2_BATCH})")
+    if net.stage2_batch < net.stage2_batch_star:
+        print(f"  headroom: B* = {net.stage2_batch_star} would stop Stage 2 "
+              f"binding anywhere (--stage2-batch auto)")
     print(f"Achieved throughput  : {net.achieved_macs_cycle:.2f} MACs/cycle  "
           f"(ideal {ideal}  ->  {net.achieved_macs_cycle / ideal * 100:.1f}% array efficiency"
           f"  == the Util column)")
@@ -344,6 +391,12 @@ if __name__ == "__main__":
                         help="weight density", type=float)
     parser.add_argument("--seed", default=0, type=int,
                         help="synthetic sparsity RNG seed (default: 0)")
+    parser.add_argument("--stage2-batch", default="native",
+                        help="Stage-2 router width B (stage2 = ceil(n_pairs/B)): "
+                             "'native' = as-built, B=M in act / B=1 in channel "
+                             "(default); 'auto' = one network-wide B = max B*, "
+                             "the narrowest router that stops binding anywhere; "
+                             "or a fixed integer, e.g. 12")
     parser.add_argument("--sweep", action="store_true",
                         help="run an activation/weight density grid on the new "
                              "act architecture")
@@ -366,7 +419,16 @@ if __name__ == "__main__":
         from workloads.mobilenetv2 import LAYERS
         net_label = "MobileNetV2"
 
-    cfg = HwConfig(ARCH=arch)   # defaults: N_PE=8, M=4, FREQ_HZ=1e9
+    batch = args.stage2_batch
+    if batch not in ("native", "auto"):
+        try:
+            batch = int(batch)
+        except ValueError:
+            parser.error("--stage2-batch must be 'native', 'auto', or an integer")
+        if batch < 1:
+            parser.error("--stage2-batch integer must be >= 1")
+
+    cfg = HwConfig(ARCH=arch, STAGE2_BATCH=batch)   # defaults: N_PE=8, M=4, 1GHz
 
     if args.sweep:
         try:
@@ -379,7 +441,8 @@ if __name__ == "__main__":
         print(f"goSPA perf-model sparsity sweep -- {net_label}")
         print(f"  HW : N_PE={cfg.N_PE}  M={cfg.M}  "
               f"FREQ={cfg.FREQ_HZ/1e9:.1f} GHz")
-        print(f"  Arch : {cfg.ARCH}  (Stage-1 enum: {cfg.STAGE1_ENUM})")
+        print(f"  Arch : {cfg.ARCH}  (Stage-1 enum: {cfg.STAGE1_ENUM}, "
+          f"Stage-2 batch: {cfg.STAGE2_BATCH})")
         print(f"  Activation densities : {activation_densities}")
         print(f"  Weight densities     : {weight_densities}")
         print(f"  Seed : {args.seed}")
@@ -406,7 +469,8 @@ if __name__ == "__main__":
 
     print(f"goSPA perf model -- {net_label}")
     print(f"  HW : N_PE={cfg.N_PE}  M={cfg.M}  FREQ={cfg.FREQ_HZ/1e9:.1f} GHz")
-    print(f"  Arch : {cfg.ARCH}  (Stage-1 enum: {cfg.STAGE1_ENUM})")
+    print(f"  Arch : {cfg.ARCH}  (Stage-1 enum: {cfg.STAGE1_ENUM}, "
+          f"Stage-2 batch: {cfg.STAGE2_BATCH})")
     print(f"  Sparsity : d_a={new_layers[0].d_a}  d_w={new_layers[0].d_w}  (synthetic phase-1)")
     print(f"  Baseline : {'disabled' if args.no_baseline else 'enabled (doubles runtime)'}")
     print(f"  Layers   : {len(new_layers)}")

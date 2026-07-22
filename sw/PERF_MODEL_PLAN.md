@@ -116,9 +116,15 @@ stream, the F²×FIFO-A contents, and `fifo_b[k]` for each PE `k`.
   n_pairs)` (1-pair/cycle emit) and `"serial"` = `n_nz + n_pairs` (serial emit, the old
   default). Stage-1 stalls on FIFO-A-full (the all-or-nothing join in `apu_stage1.sv`)
   are captured by the per-pass `max()` over stages, not charged here.
-- **APU Stage 2 (router/broadcast):** drains FIFO-A in PID order, ~1 entry
-  broadcast/cycle (fan-out to matching PEs is parallel).
-  `stage2 ≈ Σ_pid len(FIFO_A[pid])`.
+- **APU Stage 2 (router/broadcast):** drains FIFO-A in PID order, popping `B` heads
+  per cycle (fan-out to matching PEs is parallel): **`stage2 = ceil(n_pairs / B)`**.
+  `B` is `STAGE2_BATCH`; `"native"` (the **default**) is the as-built width — `B = M`
+  in `"act"` (the FIFO-A→FIFO-B transfer is widened to `M` activations/cycle) and
+  `B = 1` in `"channel"`. **`n_pairs` is gated on zero *activations* only** — the
+  router pops a head whether or not any PE's WSP wants it (`functional.py`
+  `n_pairs=len(zero_act_filter(pairs))`; `routing.sv` `go = head_valid && all_ready`
+  with `go` independent of `sel`). That is the origin of the `d_w` cap in §12.
+  Knobs: a fixed integer `B`, or `"auto"` → `B*` (below).
 - **PE (usual bottleneck):** for each PE walk `fifo_b[k]`; 1 activation/cycle, plus
   reload stalls on PID change. With the `Curr`/`Next` double buffer (the default,
   faithful model) a reload is hidden behind the previous PID's run:
@@ -183,7 +189,8 @@ functional.py     # golden functional model + goSPA_route() routing accessor
                   #   (additive: shared front end for goSPA_run and the perf model)
 config.py         # DONE: HwConfig dataclass: N_PE, M (mults/PE), FREQ_HZ,
                   #   FIFO_A_DEPTH/FIFO_B_DEPTH, W_UPDATE_PENALTY, FILL/DRAIN,
-                  #   ACT_W/PID_W/CID_W, mem latency L / bandwidth B
+                  #   ACT_W/PID_W/CID_W, mem latency L / bandwidth B,
+                  #   STAGE1_ENUM, STAGE2_BATCH (router width B -- see sec.13)
 layer.py          # Layer descriptor + output-channel pass loop;
                   #   reuses goSPA_multichannel for Cin accumulation
 perf_pe.py        # DONE: single-PE timing — instruments the v2 PE; double-buffer
@@ -215,6 +222,9 @@ Per layer and per network:
   it answers a *different* question and is not the reported aggregate.) This aggregate
   equals `achieved_macs_cycle / ideal` by construction;
 - achieved vs. ideal MAC throughput;
+- **Stage-2 router width** `B` used, and **`B*`** per layer and per network — the
+  narrowest router that would stop Stage 2 binding (§13). `B*` is reported even when
+  `B` is pinned, so the headroom above the `d_w` cap is always visible;
 - **speedup vs. a dense baseline** (same array, no sparsity skipping) — the headline
   number to compare against the paper's Table.
 
@@ -312,7 +322,7 @@ tracks `d_w` almost exactly — 0.49 @ `d_w=0.5`, 0.27 @ `d_w=0.1`).
 | within PE | 1 activation → `M` lanes | **`M` activations → `M` mults** |
 | WSP | `M` per-lane, **union**-gated | **single** WSP, no union |
 | output chans/pass | `N_PE·M` | **`N_PE`** (⇒ `M×` more tiles/passes) |
-| Stage 2 | `n_pairs` (1 pair/cycle) | **`ceil(n_pairs / M)`** (M-wide FIFO-A→B) |
+| Stage 2 | `ceil(n_pairs/B)`, `B=1` native | `ceil(n_pairs/B)`, **`B=M`** native |
 | PE `k` cycles | `\|FIFO_B_k\|` + reload(`P=M`) | **`Σ_g ceil(run_len_g / M)`**, no reload |
 | useful MACs / PE | `Σ popcount(lane WSPs)` | `\|FIFO_B_k\|` |
 | util ceiling | ≈ `d_w` | ≈ `1 − tail`, set by PID-run length ⟂ `d_w` |
@@ -352,3 +362,86 @@ runs are long **and** the front end is not the binding stage — so a genuine `a
 likely also needs a widened Stage 1 (the `STAGE1_ENUM` knob can explore this). Real
 sparsity maps (§6) may shift the crossover; the model now reports the bottleneck
 per layer so the trade is measured, not assumed.
+
+---
+
+## 13. The `d_w` utilization cap and the Stage-2 router width (`STAGE2_BATCH`)
+
+**Observation.** Under `"native"`, `array_util ≈ d_w` for *both* arches, and it is
+**flat in `d_a`** — a `d_a` sweep at `d_w=0.8` puts every AlexNet conv layer at
+`util ≈ 0.8` regardless of which stage the report names as the bottleneck.
+
+**Cause — a rigorous, bottleneck-independent cap.** In `act`, useful work is exactly
+`N_PE · d_w · n_pairs` (each PE holds one kernel and admits the `d_w` fraction of the
+shared pair stream), while `pass_cycles ≥ stage2 = ceil(n_pairs/B)`. Therefore
+
+```
+array_util  ≤  d_w · B / M                     (act, B/M = 1 natively)
+```
+
+**always** — this needs Stage 2 only to be a *lower bound* on wall-clock, not to be the
+binding stage. Being PE-bound makes `pass_cycles` larger and pushes util further
+*below* the cap; it can never lift it above. The union penalty of §12 is a *symptom*
+of this, not the root cause: `act` did not remove the union, it **relocated** it from
+intra-PE lanes to the shared inter-PE router.
+
+**Why util sits so close to the cap.** With `pe_cycles_k ≈ (nnz_k/F²)·(n_pairs/M)/tail`:
+
+```
+array_util = d_w · min(1, tail · F² / nnz_max)      ⇒   d_w·tail ≤ util ≤ d_w
+```
+
+and since `nnz_max ≤ F²`, **PE-bound ⟺ `nnz_max > tail·F²` ⟺ the fullest kernel is
+essentially dense** — which is exactly the condition making the load-imbalance ratio
+`mean_k(nnz)/max_k(nnz) ≈ d_w·F²/F² = d_w`. The two regimes are not a coincidence:
+being PE-bound *implies* the imbalance ratio is ≈`d_w`, and they hand off continuously.
+Verified (`act` 8×4, `d_a=1.0`, `d_w=0.8`): F=3 → PE-bound, `mean/max=0.836≈d_w`;
+F=9 → Stage-2-bound, `mean/max=0.927` (well above `d_w`) yet `util=0.795≈d_w`.
+Shrinking to `N_PE=M=1` removes the union *and* the tail but lands **exactly** on the
+cap (`util=d_w`, 100% Stage-2-bound) at 1/32 the throughput — the cap is structural.
+
+**The fix — `B*`.** Widening the router scales the cap by `B/M`. The knee is
+
+```
+B* = max(1, ceil(n_pairs / max(stage1, pe_stage, mem)))
+```
+
+the narrowest router that stops being the bottleneck. `stage1`/`pe_stage`/`mem` are all
+**independent of `B`**, so `B*` is computable in one shot with no circular dependency,
+and `perf_model.rescore_at_batch` / `layer.rescore_layer_at_batch` can re-derive any
+`B` from stored counters **without re-routing** — which is what makes network-scope
+`"auto"` free. `B*` generalizes the analytic `B* ≈ M/d_w` law (verified: knee at 8/12/18
+for `d_w` = 0.5/0.3/0.2 with `M=4`) and correctly stops short on small kernels where
+Stage 1 (`n_nz`, 1 activation/cycle) takes over first.
+
+**Scope.** `"auto"` is resolved at **network scope** — one fixed width for every layer,
+`B = max` of per-pass `B*` over the whole network, because that is what fixed-width
+hardware is. This over-provisions the small-kernel layers; the per-layer `B*` column in
+`sim.py`'s report makes that visible. The dense baseline is re-scored at the *same*
+width (same hardware), so speedup stays a data comparison.
+
+**Payoff** (`act` 8×4, F=9, `d_a=1.0`) — concentrated exactly where GoSPA claims its
+value, and worth nothing in the dense corner:
+
+| `d_w` | `util` @ `B=M` | `util` @ `B*` | speedup |
+|---|---|---|---|
+| 0.2 | 0.203 | 0.713 | 3.5× |
+| 0.3 | 0.298 | 0.743 | 2.5× |
+| 0.5 | 0.498 | 0.801 | 1.6× |
+| 0.8 | 0.795 | 0.873 | 1.10× |
+| 1.0 | 0.942 | 0.942 | 1.00× |
+
+After the fix the binding stage is the **PE** (ceiling = `tail × mean/max` imbalance,
+≈0.87) on large kernels, or **Stage 1** on `3×3` — the next thing to attack. On a
+2-layer `d_a=0.4/d_w=0.3` probe, `auto` (B=9) moved util 0.277 → 0.975 and
+speedup-vs-dense 2.47× → 8.40×; the dense baseline is PE-limited and flat in `B`
+(146,016 cycles for every `B ≥ 4`), so widening the router is precisely what converts
+weight sparsity into speedup.
+
+**Caveats.** (1) `"auto"` is an *analysis* knob — it answers "how wide would it have to
+be", not "how wide is it"; the default stays `"native"` so the model keeps matching the
+RTL. (2) Cost is not modeled: `routing.sv` pops one head/cycle, so `B` heads/cycle means
+a `B`-way arbiter, `B×` broadcast width and `B×` FIFO-B write ports — at `d_w=0.2`,
+`B*≈20` is not a small router. (3) Back-pressure is not modeled (§3), so at `B > M` the
+arrival rate is bursty above the PE drain rate and `FIFO_B_DEPTH` becomes load-bearing
+in a way this model cannot see. `B*` is a mean-rate argument.
