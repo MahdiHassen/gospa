@@ -9,13 +9,11 @@ the PE array over `N_PE` parallel FIFO-B read ports.
                      +-----------------------------------------------------------+
                      |                            apu.sv                         |
    fill_entry_* ---->|  +--------------------+     +-----------+   +----------+  |
-   fill_rptr_*  ---->|  | act_sram_scanner   |---->| apu_stage1|-->| apu_stage2|->-> fifob_rd_*
+   fill_rptr_*  ---->|  | act_sram_scanner   |---->| apu_stage1|-->| apu_stage2|->-> fifob_rd_* (beats)
    scan_*       ---->|  | (SRAM + CSR FSM)   |     | (FIFO-A)  |   | (routing |  |
                      |  +--------------------+     +-----------+   |   + FIFO-B)| |
-   wsp_*        ---->|  +--------------------+                     +----------+  |
-                     |  | wsp_file (flops)   |--------------------------^        |
-                     |  +--------------------+                                   |
-                     |                                                           |
+   wsp (per-PE) ---->|-------------------------------------------------^        |
+                     |    (driven by the PE array; each PE derives its own WSP)  |
    s2_start, ...   ->|                                                           |
                      +-----------------------------------------------------------+
 ```
@@ -31,6 +29,7 @@ lives on that top-level interface.
 | `F`         | 3       | Convolution kernel size (F × F).                               |
 | `S`         | 1       | Convolution stride.                                            |
 | `N_PE`      | 8       | Number of PE / FIFO-B output ports.                            |
+| `NUM_MULTS` | 4       | Activations per FIFO-B beat = FIFO-A read width (M).           |
 | `N_ROWS`    | 32      | Activation rows the scanner can hold (== row_ptr flop depth).  |
 | `N_NZ_MAX`  | 1024    | Max non-zeros the activation SRAM can hold.                    |
 | `DATA_W`    | 16      | Bits per activation value.                                     |
@@ -38,9 +37,8 @@ lives on that top-level interface.
 
 **Derived widths** (informational): `E = (H-F)/S+1`, `N_PID = F²`,
 `IDX_W = clog2(H)`, `CID_W = clog2(E²)`, `PID_W = clog2(F²)`,
-`PE_IDX_W = clog2(N_PE)`, `PTR_W = clog2(N_NZ_MAX+1)`,
-`ENT_AW = clog2(N_NZ_MAX)`, `RPTR_AW = clog2(N_ROWS+1)`,
-`N_CNT_W = clog2(N_ROWS+1)`, `FIFOB_W = DATA_W + PID_W + CID_W`.
+`PTR_W = clog2(N_NZ_MAX+1)`, `ENT_AW = clog2(N_NZ_MAX)`,
+`RPTR_AW = clog2(N_ROWS+1)`, `N_CNT_W = clog2(N_ROWS+1)`.
 
 ### Sizing hints
 
@@ -58,9 +56,10 @@ for that workload (the `mobilenet` make target does this).
 
 - Single positive-edge clock `clk`.
 - Active-low **synchronous** reset `rst_n`. Hold low for at least 2 cycles.
-- After reset, all storage is zeroed: `wsp_file` (no broadcasts will fire),
-  `row_ptr_q` flops (every row is "empty"), and FIFO pointers. The
-  activation SRAM is not reset, but unread on read.
+- After reset, all storage is zeroed: `row_ptr_q` flops (every row is
+  "empty") and FIFO pointers. The activation SRAM is not reset, but unread
+  on read. WSP is an external input (from the PE array), not stored here —
+  no broadcasts fire until the PEs have loaded weights.
 
 ## Activation loading (CSR)
 
@@ -108,37 +107,34 @@ The fill ports are write-only and unrelated to the read path used during
 the scan, so writes can occur while Stage 2 is busy on the *previous*
 channel — but the model TBs serialize for simplicity.
 
-## WSP loading (per-PE)
+## WSP (per-PE, from the PE array)
 
-The Weight Sparsity Pattern that routing uses to gate FIFO-B multicasts
-is held in an on-chip flop-based register file (`wsp_file.sv`). One full
-WSP per PE.
+The Weight Sparsity Pattern that routing uses to gate FIFO-B multicasts is
+a direct input to the APU, one WSP per PE. There is no on-chip WSP file:
+each PE derives its own WSP from its weight bank (`pe_mem.wsp_q`) and drives
+it straight into the router. Loading PE weights is all it takes to set up
+routing — in `gospa.sv` the PE array's `wsp` output is wired to `apu.wsp`.
 
-| Signal       | Width        | Direction | Role                              |
-|--------------|--------------|-----------|-----------------------------------|
-| `wsp_we`     | 1            | in        | Write strobe.                     |
-| `wsp_waddr`  | `PE_IDX_W`   | in        | Which PE to update (0..N_PE-1).   |
-| `wsp_wdata`  | `N_PID`      | in        | New WSP (MSB-first by PID).       |
+| Signal | Width              | Direction | Role                                 |
+|--------|--------------------|-----------|--------------------------------------|
+| `wsp`  | `[N_PE][N_PID]`    | in        | Per-PE WSP, LSB-first by PID.        |
 
-Bit ordering: `wsp_wdata[N_PID-1]` is the bit for `PID=0`, ...,
-`wsp_wdata[0]` is the bit for `PID=N_PID-1`. So
-`wsp_wdata = N_PID'b1010_0000_0` for an F=3 PE means "this PE wants
-activations whose PID is 0 or 2".
+Bit ordering: `wsp[k][p] = 1` means PE `k` has a non-zero weight at `PID=p`.
+So `wsp[k] = N_PID'b0000_0101` for an F=3 PE means "PE k wants activations
+whose PID is 0 or 2". This matches the PE weight bank directly (no reversal).
 
-For the **V2** mapping (multiple kernels per PE), the host pre-computes
-the bitwise UNION of the lane WSPs in software and writes the result as
-that PE's WSP. From the RTL's perspective every PE always has exactly
-one WSP; the "V1 vs V2" choice is purely upstream.
+For the **V2** mapping (multiple kernels per PE), the union of the lane WSPs
+is what a PE exports; from the router's perspective every PE always has
+exactly one WSP.
 
-### Safe windows to update WSPs
+### Stable-WSP requirement
 
-- After reset (every WSP defaults to 0 — no broadcasts will fire until
-  loaded).
-- Between `s2_done` and the next `s2_start` (routing FSM is in `S_IDLE`
-  / `S_DONE`).
-- Mid-pass (while `s2_busy=1`) is **unsafe**: routing samples WSPs
-  combinationally each cycle, so flipping a bit mid-drain can split one
-  PID's contents between two WSP patterns and corrupt FIFO-B.
+- Standalone (APU-only tests): drive `wsp` before `s2_start` and hold it.
+- In `gospa.sv`: `wsp` is stable once the PEs are armed (`pe_wload_done`),
+  which the host does before `s2_start`.
+- Changing `wsp` mid-pass (`s2_busy=1`) is **unsafe**: routing samples it
+  combinationally each cycle, so a change mid-drain can split one PID's
+  contents across two patterns and corrupt FIFO-B.
 
 ## Running a channel (scan + Stage 2)
 
@@ -173,7 +169,7 @@ The sequence per channel is:
 
 ```
    fill_entry_*  ↘
-   fill_rptr_*  ─┴→ wsp_we (load any new WSPs)
+   fill_rptr_*  ─┴→ wsp stable (PEs armed upstream)
                        │
                        ↓
                    scan_start ─→ ... scan_done ─→  [pipeline drain, a few cycles]
@@ -193,18 +189,25 @@ FIFO-B full, which freezes FIFO-A drain, which freezes the scanner via
 
 ## FIFO-B read interface (consumed by PEs)
 
-Standard valid/ready handshake, `N_PE` ports in parallel.
+Standard valid/ready handshake, `N_PE` ports in parallel. Each read is one
+**M-wide beat** (`NUM_MULTS` activations that share a PID, distinct CIDs) —
+the router pops up to `NUM_MULTS` same-PID entries per cycle from FIFO-A and
+packs them into one beat, so one FIFO-B entry = one beat.
 
-| Signal              | Width                              | Direction | Role                          |
-|---------------------|------------------------------------|-----------|-------------------------------|
-| `fifob_rd_valid`    | `[N_PE]`                           | out       | Per-PE: 1 if `fifob_rd_data` is valid. |
-| `fifob_rd_data`     | `[N_PE][DATA_W+PID_W+CID_W]`       | out       | `{Axy, PID, CID}` per PE.     |
-| `fifob_rd_ready`    | `[N_PE]`                           | in        | Per-PE: pop on this cycle.    |
+| Signal                | Width                          | Direction | Role                                 |
+|-----------------------|--------------------------------|-----------|--------------------------------------|
+| `fifob_rd_valid`      | `[N_PE]`                       | out       | Per-PE: 1 if a beat is present.      |
+| `fifob_rd_pid`        | `[N_PE][PID_W]`                | out       | Beat PID (shared by all lanes).      |
+| `fifob_rd_lane_valid` | `[N_PE][NUM_MULTS]`            | out       | Per-lane: this lane carries a real activation. |
+| `fifob_rd_act`        | `[N_PE][NUM_MULTS][DATA_W]`    | out       | Per-lane activation `Axy`.           |
+| `fifob_rd_cid`        | `[N_PE][NUM_MULTS][CID_W]`     | out       | Per-lane output-pixel `CID`.         |
+| `fifob_rd_ready`      | `[N_PE]`                       | in        | Per-PE: pop the beat this cycle.     |
 
-Payload layout (MSB-first inside each port): `{Axy[DATA_W-1:0],
-PID[PID_W-1:0], CID[CID_W-1:0]}`. Each PE pops independently; backpressure
-on any single PE only stalls *its* lane (until routing needs to multicast
-into a full FIFO-B, then routing stalls).
+These line up 1:1 with `pe_array`'s `fifob_*` beat inputs. Lane 0 is the
+oldest entry in the beat. A partial beat (`< NUM_MULTS` valid lanes) happens
+when a PID's remaining run is shorter than `NUM_MULTS`. Each PE pops
+independently; backpressure on any single PE only stalls *its* lane (until
+routing needs to multicast into a full FIFO-B, then routing stalls).
 
 ## Backpressure summary
 
@@ -223,14 +226,16 @@ End-to-end stall path, in order of who-stalls-whom:
 
 Each input channel is one full reset-free cycle of:
 
-1. (Optional) reload `wsp_file` if the chunking changed.
+1. (Optional) reload PE weights if the chunking changed — this updates the
+   `wsp` the PEs export.
 2. Refill `row_ptr` and the entry SRAM with the new channel's CSR.
 3. Pulse `scan_start`; wait for `scan_done`.
 4. Pulse `s2_start`; wait for `s2_done`; drain FIFO-B in parallel.
 
-WSPs and SRAM contents persist across channels — only rewrite what
-changed. The PE-side accumulator persistence (sum over input channels)
-is modeled in software; see `sw/functional.py:goSPA_multichannel`.
+WSPs (via resident PE weights) and SRAM contents persist across channels —
+only rewrite what changed. The PE-side accumulator persistence (sum over
+input channels) is modeled in software; see
+`sw/functional.py:goSPA_multichannel`.
 
 ## Verification entry points
 
@@ -250,7 +255,6 @@ through `fm.goSPA_route(...)`; the per-test goldens build their expected
 
 - `apu.sv` — top-level wiring.
 - `act_sram_scanner.sv` — activation SRAM + CSR-to-coordinate FSM.
-- `wsp_file.sv` — per-PE WSP register file.
 - `stage1/apu_stage1.sv` — zero_act → position_encode → idgen → FIFO-A bank.
 - `stage2/apu_stage2.sv` — routing → FIFO-B bank.
 - `stage2/routing.sv` — drain-and-multicast core.

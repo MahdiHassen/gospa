@@ -38,13 +38,14 @@ import functional as fm                                  # noqa: E402
 fm._VERBOSE = False
 
 # -- Config (must match Makefile -P/-G overrides) ---------------------------
-H        = int(os.environ.get("H", "8"))
-F        = int(os.environ.get("F", "3"))
-S        = int(os.environ.get("S", "1"))
-N_PE     = int(os.environ.get("N_PE", "4"))
-N_ROWS   = int(os.environ.get("N_ROWS",   str(H)))     # rows the scanner walks
-N_NZ_MAX = int(os.environ.get("N_NZ_MAX", str(H * H))) # entry SRAM depth
-DATA_W   = 16
+H         = int(os.environ.get("H", "8"))
+F         = int(os.environ.get("F", "3"))
+S         = int(os.environ.get("S", "1"))
+N_PE      = int(os.environ.get("N_PE", "4"))
+NUM_MULTS = int(os.environ.get("NUM_MULTS", "4"))       # activations per FIFO-B beat
+N_ROWS    = int(os.environ.get("N_ROWS",   str(H)))     # rows the scanner walks
+N_NZ_MAX  = int(os.environ.get("N_NZ_MAX", str(H * H))) # entry SRAM depth
+DATA_W    = 16
 
 
 def _rtl_clog2(n):
@@ -59,9 +60,15 @@ IDX_W     = 1 if H       < 2 else _rtl_clog2(H)
 PTR_W     = 1 if (N_NZ_MAX + 1) < 2 else _rtl_clog2(N_NZ_MAX + 1)
 ENT_AW    = 1 if N_NZ_MAX       < 2 else _rtl_clog2(N_NZ_MAX)
 RPTR_AW   = 1 if (N_ROWS + 1)   < 2 else _rtl_clog2(N_ROWS + 1)
-FIFOB_W   = DATA_W + PID_W + CID_W
 
 CLK_NS = 10
+
+
+def _field(binstr, lsb, width):
+    """Extract an unsigned field [lsb +: width] from a packed-vector binstr
+    (MSB-first). Element e of `logic [..][W-1:0]` lives at lsb = e*W."""
+    L = len(binstr)
+    return int(binstr[L - lsb - width : L - lsb], 2)
 
 
 # ---------------------------------------------------------------------------
@@ -109,12 +116,14 @@ def _rand_wsps(rng):
     return [[rng.randint(0, 1) for _ in range(N_PID)] for _ in range(N_PE)]
 
 
-def _pack_one_wsp(wsp_per_pe):
-    """Pack one PE's WSP (list[N_PID], index = PID) MSB-first to match RTL."""
+def _pack_wsps(wsps):
+    """Pack the full wsp[N_PE][N_PID] input, LSB-first by PID (matches pe.wsp).
+    PE k occupies bits [k*N_PID +: N_PID]; bit p within = wsps[k][p]."""
     val = 0
-    for p in range(N_PID):
-        if wsp_per_pe[p]:
-            val |= 1 << (N_PID - 1 - p)
+    for k in range(N_PE):
+        for p in range(N_PID):
+            if wsps[k][p]:
+                val |= 1 << (k * N_PID + p)
     return val
 
 
@@ -134,9 +143,7 @@ async def reset(dut):
     dut.scan_n_rows.value       = 0
     dut.scan_base_row.value     = 0
     dut.s2_start.value          = 0
-    dut.wsp_we.value            = 0
-    dut.wsp_waddr.value         = 0
-    dut.wsp_wdata.value         = 0
+    dut.wsp.value               = 0
     dut.fifob_rd_ready.value    = 0
     for _ in range(4):
         await RisingEdge(dut.clk)
@@ -145,15 +152,8 @@ async def reset(dut):
 
 
 async def load_wsps(dut, wsps):
-    """Write each PE's WSP into the on-chip wsp_file (one per cycle)."""
-    dut.wsp_we.value = 1
-    for k in range(N_PE):
-        dut.wsp_waddr.value = k
-        dut.wsp_wdata.value = _pack_one_wsp(wsps[k])
-        await RisingEdge(dut.clk)
-    dut.wsp_we.value    = 0
-    dut.wsp_waddr.value = 0
-    dut.wsp_wdata.value = 0
+    """Drive the per-PE WSP input directly (models the PE array's wsp export)."""
+    dut.wsp.value = _pack_wsps(wsps)
     await RisingEdge(dut.clk)
 
 
@@ -237,7 +237,12 @@ async def feed_matrix(dut, matrix):
 
 
 async def run_stage2_and_drain(dut, timeout=200000):
-    """Pulse s2_start, drain FIFO-B concurrently, return list[N_PE] of (a,p,c)."""
+    """Pulse s2_start, drain FIFO-B concurrently, return list[N_PE] of (a,p,c).
+
+    Each FIFO-B entry is one M-wide beat: {pid, lane_valid[M], act[M], cid[M]}.
+    A beat is flattened back to its valid (axy, pid, cid) entries in lane order
+    (lane 0 = oldest) so the result matches the functional model's flat stream.
+    """
     collected = [[] for _ in range(N_PE)]
     dut.fifob_rd_ready.value = (1 << N_PE) - 1
 
@@ -253,23 +258,32 @@ async def run_stage2_and_drain(dut, timeout=200000):
         await ReadOnly()
         vbits = int(dut.fifob_rd_valid.value)
         if vbits != 0:
-            binstr = dut.fifob_rd_data.value.binstr   # MSB-first
-            L = len(binstr)
+            pid_s = str(dut.fifob_rd_pid.value)
+            lv_s  = str(dut.fifob_rd_lane_valid.value)
+            act_s = str(dut.fifob_rd_act.value)
+            cid_s = str(dut.fifob_rd_cid.value)
             for k in range(N_PE):
                 if (vbits >> k) & 1:
-                    field = binstr[L - (k + 1) * FIFOB_W : L - k * FIFOB_W]
-                    payload = int(field, 2)
-                    cid = payload & ((1 << CID_W) - 1)
-                    pid = (payload >> CID_W) & ((1 << PID_W) - 1)
-                    axy = (payload >> (CID_W + PID_W)) & ((1 << DATA_W) - 1)
-                    collected[k].append((axy, pid, cid))
+                    pid = _field(pid_s, k * PID_W, PID_W)
+                    for i in range(NUM_MULTS):
+                        lane = k * NUM_MULTS + i
+                        if _field(lv_s, lane, 1):
+                            axy = _field(act_s, lane * DATA_W, DATA_W)
+                            cid = _field(cid_s, lane * CID_W, CID_W)
+                            collected[k].append((axy, pid, cid))
         if int(dut.s2_done.value) == 1:
             seen_done = True
         await RisingEdge(dut.clk)
+        # s2_done pulses ~1 cycle after the last beat is pushed, but a beat then
+        # needs a few more cycles to surface through FIFO-B's show-ahead. Wait
+        # for a run of consecutive idle cycles (reset on any valid) that clears
+        # the router -> FIFO-B latency before declaring the drain complete.
         if seen_done and vbits == 0:
             drain_extra += 1
-            if drain_extra >= 2:
+            if drain_extra >= 8:
                 break
+        else:
+            drain_extra = 0
         guard += 1
 
     dut.fifob_rd_ready.value = 0

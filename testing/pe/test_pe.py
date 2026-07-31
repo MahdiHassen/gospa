@@ -1,20 +1,25 @@
 """
-test_pe.py -- cocotb tests for pe.sv (GoSPA Processing Element)
+test_pe.py -- cocotb tests for pe.sv (GoSPA Processing Element, V2 "act" dataflow)
 GoSPA Project -- Team 19, ECE 720 (Spring 2026)
 
 Run with `make pe` (see testing/pe/Makefile for targets and knobs).
 
+Arch under test: ONE kernel per PE. Each cycle the PE takes an M-wide FIFO-B beat
+-- up to NUM_MULTS activations that share a PID but carry distinct CIDs -- and
+multiplies them all by the single Curr weight selected by that PID, accumulating
+each product into its CID bank. The M per-lane banks are summed at drain into one
+E x E output map for this PE's output channel.
+
 Verification: the PE is checked against TRUE DENSE CONVOLUTION
-(functional.conv2d_reference), NOT against functional.pe_process. The team's
-pe_process uses a single-step Curr/Next slide that multiplies by the wrong
-weight whenever a non-zero weight PID receives no activation (sparse inputs);
-it disagrees with dense conv in ~14% of random sparse cases. pe.sv handles that
-SKIP case correctly, so dense conv is the right golden.
+(functional.conv2d_reference). functional.pe_process describes the same dataflow
+but uses a sequential Curr/Next slide that mis-selects a weight when a non-zero
+weight PID receives no activation (sparse inputs); pe.sv handles that SKIP case
+via direct-index refill, so dense conv is the right golden.
 
 For each (activation, kernel): route it through the real functional front end
-(Stage 1 + Stage 2 for a single PE) to get the PID-ordered FIFO-B stream and the
-sparse weight list, drive both into the DUT, drain the accumulators, and compare
-the E x E result against conv2d_reference.
+(Stage 1 + Stage 2 for a single PE) to get the PID-ordered FIFO-B stream, pack it
+into M-wide same-PID beats (the router's job, modelled here), drive it into the
+DUT, drain the accumulator, and compare the E x E result against conv2d_reference.
 """
 
 import os
@@ -36,7 +41,7 @@ fm._VERBOSE = False
 H          = int(os.environ.get("H", "8"))
 F          = int(os.environ.get("F", "3"))
 S          = int(os.environ.get("S", "1"))
-NUM_MULTS  = int(os.environ.get("NUM_MULTS", "4"))   # V2 default: 4 lanes/PE (synth config)
+NUM_MULTS  = int(os.environ.get("NUM_MULTS", "4"))   # activations consumed per beat
 DATA_WIDTH = 16
 ACC_WIDTH  = 32
 
@@ -47,7 +52,6 @@ CLK_NS  = 2      # clock period in ns -> 500 MHz (simulation only)
 # Override the clock the perf report quotes GMAC/s at (e.g. the period the
 # synthesis flow actually closes on). Default: the simulated clock.
 FCLK_MHZ    = os.environ.get("FCLK_MHZ")
-RPTR_WIDTH  = max(1, (NUM_PID + 1 - 1).bit_length())
 CID_WIDTH   = 1 if NUM_CID < 2 else (NUM_CID - 1).bit_length()
 
 
@@ -63,7 +67,10 @@ def _mask(v, bits):
 # Golden + routing, straight from the functional model
 # ---------------------------------------------------------------------------
 def route_single_pe(act, ker):
-    """Run the real front end for one kernel -> (fifo_b, sparse_weights)."""
+    """Run the real front end for one kernel -> (fifo_b, sparse_weights).
+
+    fifo_b is the flat PID-ordered [(axy, cid, pid), ...] stream this PE receives
+    (only PIDs where the kernel is non-zero, i.e. WSP-gated)."""
     values, col_idx, row_ptr = fm.dense_to_csr(act)
     wsp, sw = fm.kernel_to_sparse(ker)
     pos = fm.csr_to_positional(values, col_idx, row_ptr)
@@ -77,6 +84,40 @@ def route_single_pe(act, ker):
     return fifo_b, sw
 
 
+def pack_beats(fifo_b, mults):
+    """Model the router: group the PID-ordered stream into M-wide beats.
+
+    Greedily take up to `mults` consecutive entries that share a PID (a differing
+    PID cuts the beat short, matching functional.pe_process's dispatch rule).
+    Returns [(pid, [(act, cid), ...]), ...] with 1 <= len(lanes) <= mults."""
+    beats = []
+    cur_pid = None
+    lanes = []
+    for (axy, cid, pid) in fifo_b:
+        if pid != cur_pid or len(lanes) == mults:
+            if lanes:
+                beats.append((cur_pid, lanes))
+            cur_pid = pid
+            lanes = []
+        lanes.append((axy, cid))
+    if lanes:
+        beats.append((cur_pid, lanes))
+    return beats
+
+
+def _pack_lane_words(lanes):
+    """Pack a beat's lanes into (act_word, cid_word, valid_mask) for the DUT's
+    [NUM_MULTS-1:0][..] vectors. Unused lanes read 0 / valid 0."""
+    act_word = 0
+    cid_word = 0
+    valid    = 0
+    for k, (axy, cid) in enumerate(lanes):
+        act_word |= _mask(axy, DATA_WIDTH) << (k * DATA_WIDTH)
+        cid_word |= (cid & ((1 << CID_WIDTH) - 1)) << (k * CID_WIDTH)
+        valid    |= 1 << k
+    return act_word, cid_word, valid
+
+
 def rand_matrix(R, C, density, rng, lo=-9, hi=9):
     return [[(rng.randint(lo, hi) if rng.random() < density else 0)
              for _ in range(C)] for _ in range(R)]
@@ -88,13 +129,13 @@ def rand_matrix(R, C, density, rng, lo=-9, hi=9):
 async def reset(dut):
     dut.rst_n.value         = 0
     dut.wfill_we.value      = 0
-    dut.wfill_lane.value    = 0
     dut.wfill_pid.value     = 0
     dut.wfill_val.value     = 0
     dut.wload_done.value    = 0
     dut.b_valid.value       = 0
-    dut.b_act.value         = 0
     dut.b_pid.value         = 0
+    dut.b_lane_valid.value  = 0
+    dut.b_act.value         = 0
     dut.b_cid.value         = 0
     dut.drain_start.value   = 0
     dut.out_ready.value     = 0
@@ -105,36 +146,34 @@ async def reset(dut):
 
 
 async def load_weights(dut, sw):
-    """Single-channel load into lane 0 of an NUM_MULTS-wide V2 PE.
+    """Fill this PE's single weight bank in PID order, then arm.
 
-    The PE derives each lane's slot, weight count, and WSP from the fill
-    stream, so we just append sw[i] to lane 0 and pulse wload_done. Other
-    lanes get no fills -> count 0, WSP 0 -> they IDLE on every activation.
-    """
-    # 1) weight SRAM fill (lane 0): append one weight per cycle in PID order.
+    The PE derives slot, weight count, and WSP from the fill stream, so we just
+    append sw[i] and pulse wload_done. An empty sw simply arms an empty bank."""
     for (pid, val) in sw:
-        dut.wfill_we.value   = 1
-        dut.wfill_lane.value = 0
-        dut.wfill_pid.value  = pid
-        dut.wfill_val.value  = _mask(val, DATA_WIDTH)
+        dut.wfill_we.value  = 1
+        dut.wfill_pid.value = pid
+        dut.wfill_val.value = _mask(val, DATA_WIDTH)
         await RisingEdge(dut.clk)
     dut.wfill_we.value = 0
 
-    # 2) arm: pulse wload_done. The PE arms the next cycle with an empty window
-    # (no warm sequence); each lane's first hit fetches its weight on demand.
+    # Arm: the PE runs next cycle with an empty window (no warm sequence); the
+    # first hit fetches its weight on demand (one SKIP stall).
     dut.wload_done.value = 1
     await RisingEdge(dut.clk)
     dut.wload_done.value = 0
     await RisingEdge(dut.clk)
 
 
-async def stream_fifo_b(dut, fifo_b):
-    """Feed (axy, cid, pid) honoring b_ready (which stalls during weight skips)."""
-    for (axy, cid, pid) in fifo_b:
-        dut.b_valid.value = 1
-        dut.b_act.value   = _mask(axy, DATA_WIDTH)
-        dut.b_pid.value   = pid
-        dut.b_cid.value   = cid
+async def stream_beats(dut, beats):
+    """Drive M-wide beats honoring b_ready (which stalls during weight skips)."""
+    for (pid, lanes) in beats:
+        act_word, cid_word, valid = _pack_lane_words(lanes)
+        dut.b_valid.value      = 1
+        dut.b_pid.value        = pid
+        dut.b_lane_valid.value = valid
+        dut.b_act.value        = act_word
+        dut.b_cid.value        = cid_word
         while True:
             await RisingEdge(dut.clk)
             if dut.b_ready.value == 1:
@@ -144,26 +183,22 @@ async def stream_fifo_b(dut, fifo_b):
 
 
 async def drain(dut, timeout=20000):
-    """Pulse drain_start, collect lane-0's NUM_CID accumulator beats -> {cid: acc}.
+    """Pulse drain_start, collect the PE's NUM_CID accumulator beats -> {cid: acc}.
 
-    out_valid/cid/acc are now packed [NUM_MULTS-1:0]/[NUM_MULTS-1:0][...]; we
-    just inspect lane 0 (LSB) for the single-channel test.
-    """
+    Output is now a single stream (the M banks summed per CID)."""
     dut.drain_start.value = 1
     await RisingEdge(dut.clk)
     dut.drain_start.value = 0
-    dut.out_ready.value = (1 << NUM_MULTS) - 1
+    dut.out_ready.value   = 1
     got = {}
     cid_mask = (1 << CID_WIDTH) - 1
     acc_mask = (1 << ACC_WIDTH) - 1
     guard = 0
     while len(got) < NUM_CID and guard < timeout:
         await ReadOnly()
-        ov = int(dut.out_valid.value)
-        if ov & 1:                                          # lane 0 valid
-            cid0 = int(dut.out_cid.value) & cid_mask        # lane 0 -> LSBs
-            acc0_u = int(dut.out_acc.value) & acc_mask
-            got[cid0] = _signed(acc0_u, ACC_WIDTH)
+        if int(dut.out_valid.value):
+            cid = int(dut.out_cid.value) & cid_mask
+            got[cid] = _signed(int(dut.out_acc.value) & acc_mask, ACC_WIDTH)
         await RisingEdge(dut.clk)
         guard += 1
     dut.out_ready.value = 0
@@ -172,11 +207,12 @@ async def drain(dut, timeout=20000):
 
 async def run_case(dut, act, ker, name):
     fifo_b, sw = route_single_pe(act, ker)
+    beats  = pack_beats(fifo_b, NUM_MULTS)
     golden = fm.conv2d_reference(act, ker, S)          # E x E, true dense conv
 
     await reset(dut)
     await load_weights(dut, sw)
-    await stream_fifo_b(dut, fifo_b)
+    await stream_beats(dut, beats)
     got = await drain(dut)
 
     # Reshape {cid: acc} -> E x E and compare against dense conv.
@@ -190,7 +226,7 @@ async def run_case(dut, act, ker, name):
     )
     nz = sum(1 for r in golden for v in r if v != 0)
     dut._log.info(f"[{name}] PASS  H={H} F={F} S={S}  ({len(fifo_b)} acts, "
-                  f"{len(sw)} weights, {nz} nonzero outputs)")
+                  f"{len(beats)} beats, {len(sw)} weights, {nz} nonzero outputs)")
 
 
 # ===========================================================================
@@ -213,42 +249,41 @@ def _safe_int(sig):
 
 
 class PerfCounters:
-    """Cycle counters for one PE run. All counts are in clk cycles."""
+    """Cycle counters for one PE run. All counts are in clk cycles / beats."""
     __slots__ = ("cycles", "offered", "consumed", "stalled",
                  "stall_fetch", "macs", "load_cycles", "drain_cycles")
 
     def __init__(self):
         self.cycles = 0          # every sampled cycle the monitor is alive
-        self.offered = 0         # b_valid==1 (PE was presented an activation)
-        self.consumed = 0        # b_valid && b_ready (activation admitted)
-        self.stalled = 0         # b_valid && !b_ready (bubble)
-        self.stall_fetch = 0     # of the stalls, a lane was awaiting a weight fetch
-        self.macs = 0            # sum of per-lane useful MACs (popcount mac_en_q)
+        self.offered = 0         # streaming cycles (beats presented incl. stalls)
+        self.consumed = 0        # beats admitted (b_valid && b_ready)
+        self.stalled = 0         # b_valid && !b_ready (weight-fetch bubble)
+        self.stall_fetch = 0     # of the stalls, a weight fetch was pending
+        self.macs = 0            # useful MACs (sum of mac_fire pulses)
         self.load_cycles = 0     # fixed overhead: weight-load + arm
         self.drain_cycles = 0    # fixed overhead: accumulator drain-out
 
     # --- derived metrics ---------------------------------------------------
     @property
     def stall_other(self):
-        """Stalled cycles not attributed to a lane fetch -- must be 0 if
+        """Stalled cycles not attributed to a weight fetch -- must be 0 if
         need_fetch is readable (b_ready = !need_fetch)."""
         return self.stalled - self.stall_fetch
 
     @property
     def overall_lane_util(self):
-        """Useful MACs / (offered x NUM_MULTS): fraction of multiplier-slots
-        doing useful work, counting fetch-stall bubbles as idle (a stalled
-        cycle is a cycle the multipliers produced nothing). offered is every
-        clk in the streaming phase (excludes weight-load and drain)."""
+        """Useful MACs / (offered x NUM_MULTS): fraction of multiplier slots
+        doing useful work, counting fetch-stall bubbles as idle. In the act
+        dataflow this is set by PID run-length (how full the M-wide beats pack),
+        not by weight sparsity. offered excludes weight-load and drain."""
         d = self.offered * NUM_MULTS
         return self.macs / d if d else 0.0
 
 
 async def _mac_cycle_monitor(dut, perf, stop):
     """Count total cycles + useful MACs from mac_fire (a 1-cycle pulse per
-    accumulate). NOTE: mac_en_q is now the multi-cycle "MAC in flight" drain
-    gate (the multiplier is deeply pipelined), so it would over-count by the
-    pipeline fill/drain tail -- mac_fire is the exact per-MAC event."""
+    accumulate, one bit per lane). The multiplier is deeply pipelined, so
+    mac_fire (not mac_busy) is the exact per-MAC event."""
     while True:
         await RisingEdge(dut.clk)
         # Check stop in the writable region so the monitor never returns parked
@@ -262,19 +297,21 @@ async def _mac_cycle_monitor(dut, perf, stop):
             perf.macs += _popcount(mf)
 
 
-async def stream_fifo_b_perf(dut, fifo_b, perf, sig_need_fetch):
-    """stream_fifo_b + per-cycle handshake accounting (offered/consumed/stalled
+async def stream_beats_perf(dut, beats, perf, sig_need_fetch):
+    """stream_beats + per-cycle handshake accounting (offered/consumed/stalled
     + stall cause).
 
-    The PE has a single stall cause: b_ready is low iff some wsp-hit lane still
-    needs to fetch its weight (need_fetch). That signal is asserted on every
+    The PE has a single stall cause: b_ready is low iff the current PID's weight
+    still needs a fetch (need_fetch / SKIP). That signal is asserted on every
     stalled cycle, so a per-cycle check attributes them all -- stall_other must
     end at 0 (verified in run_case_perf)."""
-    for (axy, cid, pid) in fifo_b:
-        dut.b_valid.value = 1
-        dut.b_act.value   = _mask(axy, DATA_WIDTH)
-        dut.b_pid.value   = pid
-        dut.b_cid.value   = cid
+    for (pid, lanes) in beats:
+        act_word, cid_word, valid = _pack_lane_words(lanes)
+        dut.b_valid.value      = 1
+        dut.b_pid.value        = pid
+        dut.b_lane_valid.value = valid
+        dut.b_act.value        = act_word
+        dut.b_cid.value        = cid_word
         while True:
             await RisingEdge(dut.clk)
             perf.offered += 1
@@ -288,28 +325,29 @@ async def stream_fifo_b_perf(dut, fifo_b, perf, sig_need_fetch):
     dut.b_valid.value = 0
 
 
-async def run_case_perf(dut, act, kernels, name, sig_need_fetch):
-    """Drive NUM_MULTS real kernels into one V2 PE, measure the streaming phase,
-    and verify every lane against dense conv. Returns (PerfCounters, n_acts)."""
-    fifo_b, per_lane_sw, per_lane_wsp = route_v2_one_pe(act, kernels)
-    goldens = [fm.conv2d_reference(act, k, S) for k in kernels]
+async def run_case_perf(dut, act, ker, name, sig_need_fetch):
+    """Drive one kernel into the PE, measure the streaming phase, and verify the
+    output against dense conv. Returns (PerfCounters, n_acts, n_beats)."""
+    fifo_b, sw = route_single_pe(act, ker)
+    beats  = pack_beats(fifo_b, NUM_MULTS)
+    golden = fm.conv2d_reference(act, ker, S)
 
     await reset(dut)
 
-    # Start the monitor before the weight load so perf.cycles captures the
-    # fixed load+arm overhead too (no MACs fire before running, so this does
-    # not perturb the MAC count).
+    # Start the monitor before the weight load so perf.cycles captures the fixed
+    # load+arm overhead too (no MACs fire before running, so it does not perturb
+    # the MAC count).
     perf = PerfCounters()
     stop = Event()
     mon = cocotb.start_soon(_mac_cycle_monitor(dut, perf, stop))
 
-    await load_weights_multi(dut, per_lane_sw, per_lane_wsp)
+    await load_weights(dut, sw)
     perf.load_cycles = perf.cycles
 
-    await stream_fifo_b_perf(dut, fifo_b, perf, sig_need_fetch)
+    await stream_beats_perf(dut, beats, perf, sig_need_fetch)
 
     c_pre_drain = perf.cycles
-    got = await drain_all_lanes(dut)
+    got = await drain(dut)
     perf.drain_cycles = perf.cycles - c_pre_drain
     stop.set()
     await mon
@@ -318,35 +356,30 @@ async def run_case_perf(dut, act, kernels, name, sig_need_fetch):
         f"[{name}] {perf.stall_other} stalled cycles unattributed "
         f"(need_fetch probe unreadable?)")
 
-    for k, golden in enumerate(goldens):
-        out = [[got[k].get(r * E + c, 0) for c in range(E)] for r in range(E)]
-        assert out == golden, (
-            f"[{name}] lane {k}  H={H} F={F} S={S}\n"
-            f"  weights(sparse) = {per_lane_sw[k]}\n"
-            f"  expected (dense)= {golden}\n"
-            f"  got (PE)        = {out}")
-    # Cross-check the monitor against the routed stream: useful MACs == the
-    # (activation, lane) pairs whose WSP hits the activation's PID.
-    expected_macs = sum(
-        1
-        for (_axy, _cid, pid) in fifo_b
-        for k in range(len(per_lane_wsp))
-        if per_lane_wsp[k][pid]
-    )
-    assert perf.macs == expected_macs, (
-        f"[{name}] monitor MACs {perf.macs} != expected {expected_macs}")
-    return perf, len(fifo_b)
+    out = [[got.get(r * E + c, 0) for c in range(E)] for r in range(E)]
+    assert out == golden, (
+        f"[{name}] H={H} F={F} S={S}\n"
+        f"  weights(sparse) = {sw}\n"
+        f"  expected (dense)= {golden}\n"
+        f"  got (PE)        = {out}")
+    # Cross-check the monitor: every routed activation is MAC'd exactly once
+    # (its PID hits this PE's WSP, since the stream is WSP-gated).
+    assert perf.macs == len(fifo_b), (
+        f"[{name}] monitor MACs {perf.macs} != activations {len(fifo_b)}")
+    return perf, len(fifo_b), len(beats)
 
 
 @cocotb.test()
 async def test_perf(dut):
-    """Measure PE throughput / stall-rate / lane-utilization across a spread of
-    activation & weight densities. Reports per-case and aggregate numbers so an
-    optimization can target the dominant loss (stalls vs union under-util).
+    """Measure PE throughput / stall-rate / multiplier-utilization across a
+    spread of activation & weight densities.
 
-    Runs in the normal suite; isolate + sweep it with e.g.
-    `TESTCASE=test_perf NUM_MULTS=4 make pe` (honors the H/F/S/NUM_MULTS knobs).
-    """
+    In the act dataflow, utilization is set by how full the M-wide same-PID beats
+    pack (PID run-length ~ how many activations share a kernel tap), plus reload
+    (SKIP) stalls on PID changes. Weight density sets how many PIDs exist;
+    activation density sets each PID's run-length.
+
+    Isolate + sweep with e.g. `TESTCASE=test_perf NUM_MULTS=4 make pe`."""
     cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
     rng = random.Random(0xBEEF)
 
@@ -358,14 +391,11 @@ async def test_perf(dut):
 
     # (name, activation density, weight density). Names read actXX_wgtYY =
     # XX% activation density, YY% weight density.
-    # Note: b_ready stalls only on lanes that can't MAC the current beat, so a
-    # same-PID run hides the fetch latency; "roofline" sustains ~1.0. Stalls
-    # appear when a lane must jump to a new weight (sparse-activation PID jumps).
     grid = [
         # dense reference
         ("roofline",     1.0, 1.0),   # both dense: peak / roofline baseline
 
-        # equal-density diagonal sweep: 90/90 down to 10/10, descending from roofline
+        # equal-density diagonal sweep: 90/90 down to 10/10
         ("act90_wgt90",  0.9, 0.9),
         ("act80_wgt80",  0.8, 0.8),
         ("act70_wgt70",  0.7, 0.7),
@@ -376,19 +406,19 @@ async def test_perf(dut):
         ("act20_wgt20",  0.2, 0.2),
         ("act10_wgt10",  0.1, 0.1),
 
-        None,   # blank-line separator: diagonal sweep above, original cases below
+        None,   # blank-line separator
 
-        # weight sweep @ dense activation: isolates union-gating (no act stalls)
+        # weight sweep @ dense activation: fewer PIDs, runs stay full (high util)
         ("act100_wgt70", 1.0, 0.7),
         ("act100_wgt50", 1.0, 0.5),
         ("act100_wgt30", 1.0, 0.3),
         ("act100_wgt10", 1.0, 0.1),
 
-        # activation sweep @ dense weight: isolates reload stalls (short PID runs)
+        # activation sweep @ dense weight: shorter PID runs -> partial beats
         ("act80_wgt100", 0.8, 1.0),
         ("act60_wgt100", 0.6, 1.0),
         ("act30_wgt100", 0.3, 1.0),
-        ("act10_wgt100", 0.1, 1.0),   # sparse act, dense wgt: reload-stall stress
+        ("act10_wgt100", 0.1, 1.0),   # sparse act, dense wgt: worst packing
 
         # mixed densities: the realistic middle of the space
         ("act80_wgt70",  0.8, 0.7),
@@ -414,17 +444,13 @@ async def test_perf(dut):
         act = rand_matrix(H, H, da, rng)
         if da >= 1.0:
             act = _fill_nonzero(act)
-        # one distinct kernel per lane -> real union-gating, not a 1-of-M artifact
-        kernels = []
-        for _ in range(NUM_MULTS):
-            ker = rand_matrix(F, F, dw, rng)
-            if dw >= 1.0:
-                ker = _fill_nonzero(ker)
-            if all(v == 0 for r in ker for v in r):
-                ker[0][0] = 3
-            kernels.append(ker)
-        perf, nacts = await run_case_perf(dut, act, kernels, nm, sig_need_fetch)
-        rows.append((nm, perf, nacts))
+        ker = rand_matrix(F, F, dw, rng)
+        if dw >= 1.0:
+            ker = _fill_nonzero(ker)
+        if all(v == 0 for r in ker for v in r):
+            ker[0][0] = 3
+        perf, nacts, nbeats = await run_case_perf(dut, act, ker, nm, sig_need_fetch)
+        rows.append((nm, perf, nacts, nbeats))
 
     # Clock-derived absolute rate: MAC/s = mac_per_cycle * f_clk. FCLK_MHZ
     # overrides the quoted clock (e.g. the synthesized period); default = sim.
@@ -434,15 +460,14 @@ async def test_perf(dut):
     else:
         f_clk_hz  = 1e9 / CLK_NS
         f_clk_src = "simulated"
-    # Cycles = offered, the sparsity-aware streaming phase (admitted acts + reload stalls);
-    # matches perf_pe.PEStats.pe_cycles. The dense baseline is the roofline case
-    # (dense act + dense wgt, same H/F/S); speedup = how much sparsity shortens
-    # that window. Weight-load + drain are fixed overhead (amortized per layer),
-    # reported separately, not folded into the speedup.
+    # Cycles = offered, the streaming phase (admitted beats + reload stalls). The
+    # dense baseline is the roofline case (dense act + dense wgt, same H/F/S);
+    # speedup = how much sparsity shortens that window. Weight-load + drain are
+    # fixed overhead (amortized per layer), reported separately.
     dense_cycles = next((r[1].offered for r in rows if r and r[0] == "roofline"), 0)
     peak_gops = NUM_MULTS * 2 * f_clk_hz / 1e9
 
-    # GOP/s over the offered (streaming) cycles (1 MAC = 2 ops); peak is NUM_MULTS*2*f_clk.
+    # GOP/s over the offered (streaming) cycles (1 MAC = 2 ops).
     def _gops(p):
         return p.macs * 2 * f_clk_hz / 1e9 / p.offered if p.offered else 0.0
 
@@ -459,7 +484,7 @@ async def test_perf(dut):
         if row is None:
             lines.append("")                     # separator between case groups
             continue
-        (nm, p, nacts) = row
+        (nm, p, nacts, nbeats) = row
         speedup = dense_cycles / p.offered if p.offered else 0.0
         lines.append(f"{nm:<12} {p.consumed:>8} {p.offered:>10} {p.cycles:>8} "
                      f"{speedup:>8.2f} {_gops(p):>8.3f} "
@@ -467,12 +492,12 @@ async def test_perf(dut):
     lines.append("-" * len(hdr))
     lines += [
         "legend:",
-        "  minCyc     = theoretical min num of cycles. 1 activation/cycle with no stalls ",
-        "  computeCyc = actual cycles it takes to process input -> minCyc + reload stalls",
+        "  minCyc     = beats admitted (1 M-wide same-PID beat/cycle, no stalls)",
+        "  computeCyc = actual streaming cycles -> minCyc + reload (SKIP) stalls",
         "  latency    = end-to-end: computeCyc + weight-load + warm-up + drain",
-        "  speedup    = baseline computeCyc / computeCyc of particular case",
-        "  GOPS/s     = rate over offered cycles, 1 MAC = 2 ops",
-        "  multUtil%  = MACs / (computeCyc x NUM_MULTS)",
+        "  speedup    = roofline computeCyc / computeCyc of this case",
+        "  GOPS/s     = rate over computeCyc, 1 MAC = 2 ops",
+        "  multUtil%  = MACs / (computeCyc x NUM_MULTS); set by PID run-length",
     ]
 
     report_path = os.path.join(os.path.dirname(__file__), "pe_perf.txt")
@@ -482,7 +507,7 @@ async def test_perf(dut):
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Correctness tests
 # ---------------------------------------------------------------------------
 @cocotb.test()
 async def test_dense(dut):
@@ -503,8 +528,8 @@ async def test_single_weight(dut):
 
 @cocotb.test()
 async def test_sparse_act_dense_wgt(dut):
-    """The case that breaks pe_process: sparse activations + dense kernel
-    => many weight PIDs get skipped. The PE must still match dense conv."""
+    """Sparse activations + dense kernel => many weight PIDs get skipped (short
+    PID runs, frequent reloads). The PE must still match dense conv."""
     cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
     rng = random.Random(3)
     for i in range(8):
@@ -529,149 +554,43 @@ async def test_random_mix(dut):
         await run_case(dut, act, ker, f"random[{i},da={da},dw={dw}]")
 
 
-# ===========================================================================
-# Multi-lane V2 with real MobileNet weights
-# ===========================================================================
-async def load_weights_multi(dut, per_lane_sw, per_lane_wsp=None):
-    """Load up to NUM_MULTS distinct kernels into one V2 PE.
-
-    per_lane_sw[k] : list[(pid, val)] for lane k (in PID order), [] if empty.
-    The PE derives each lane's slot, count, and WSP from the fill stream, so
-    per_lane_wsp is no longer driven (kept for call-site compatibility).
-    """
-    assert len(per_lane_sw) <= NUM_MULTS
-
-    # 1) per-lane weight SRAM writes: append one weight per cycle, PID order.
-    for k in range(len(per_lane_sw)):
-        for (pid, val) in per_lane_sw[k]:
-            dut.wfill_we.value   = 1
-            dut.wfill_lane.value = k
-            dut.wfill_pid.value  = pid
-            dut.wfill_val.value  = _mask(val, DATA_WIDTH)
-            await RisingEdge(dut.clk)
-    dut.wfill_we.value = 0
-
-    # 2) arm. The PE arms the next cycle with an empty window (no warm sequence);
-    # each lane's first hit fetches its weight on demand.
-    dut.wload_done.value = 1
-    await RisingEdge(dut.clk)
-    dut.wload_done.value = 0
-    await RisingEdge(dut.clk)
-
-
-async def drain_all_lanes(dut, timeout=20000):
-    """Drain NUM_MULTS lanes in parallel. Returns list[NUM_MULTS] of {cid: acc}."""
-    dut.drain_start.value = 1
-    await RisingEdge(dut.clk)
-    dut.drain_start.value = 0
-    dut.out_ready.value = (1 << NUM_MULTS) - 1
-
-    got = [dict() for _ in range(NUM_MULTS)]
-    cid_mask = (1 << CID_WIDTH) - 1
-    acc_mask = (1 << ACC_WIDTH) - 1
-    guard = 0
-    while guard < timeout and any(len(g) < NUM_CID for g in got):
-        await ReadOnly()
-        ov = int(dut.out_valid.value)
-        oc = int(dut.out_cid.value)
-        oa = int(dut.out_acc.value)
-        for k in range(NUM_MULTS):
-            if (ov >> k) & 1:
-                cid = (oc >> (k * CID_WIDTH)) & cid_mask
-                acc = _signed((oa >> (k * ACC_WIDTH)) & acc_mask, ACC_WIDTH)
-                got[k][cid] = acc
-        await RisingEdge(dut.clk)
-        guard += 1
-    dut.out_ready.value = 0
-    return got
-
-
-def route_v2_one_pe(act, kernels):
-    """Functional-model APU Stage 1 + Stage 2 for one V2 PE holding `kernels`."""
-    per_lane_wsp = []
-    per_lane_sw  = []
-    for ker in kernels:
-        w, s = fm.kernel_to_sparse(ker)
-        per_lane_wsp.append(w)
-        per_lane_sw.append(s)
-    union = fm.wsp_union(per_lane_wsp)
-
-    values, col_idx, row_ptr = fm.dense_to_csr(act)
-    pos = fm.csr_to_positional(values, col_idx, row_ptr)
-    pairs = []
-    for (axy, x, y) in pos:
-        a, px, py, cx, cy = fm.axy_to_pcid(axy, x, y, S)
-        pairs.extend(fm.pcid_to_cid_pid(a, px, py, cx, cy, F, H, S))
-    pairs = fm.zero_act_filter(pairs)
-    fifo_a = fm.route_to_fifo_a(pairs, F)
-    fifo_b = fm.broadcast_to_fifo_b(fifo_a, [union])[0]
-    return fifo_b, per_lane_sw, per_lane_wsp
-
-
+# ---------------------------------------------------------------------------
+# End-to-end with a real MobileNet kernel
+# ---------------------------------------------------------------------------
 def _make_sparse_activation(rng, density=0.5):
     return [[(rng.randint(1, 50) if rng.random() < density else 0)
              * (1 if rng.random() < 0.5 else -1) for _ in range(H)]
             for _ in range(H)]
 
 
-def _load_mobilenet_kernels(n):
-    """Load `n` red-channel kernels from MobileNetV2's first conv.
-    Falls back to synthetic INT8 kernels when F != 3 (so the test still
-    runs on other layer configs)."""
+def _load_mobilenet_kernel():
+    """Load one red-channel kernel from MobileNetV2's first conv. Falls back to
+    a synthetic INT8 kernel when F != 3 (so the test still runs on other configs)."""
     if F == 3:
         try:
             from mobilenet import get_first_conv
             _, conv0 = get_first_conv()
             iw = conv0.weight().int_repr().numpy()
-            return [[[int(v) for v in row] for row in iw[f, 0]]
-                    for f in range(min(n, iw.shape[0]))]
+            return [[int(v) for v in row] for row in iw[0, 0]]
         except Exception as exc:
-            cocotb.log.warning(f"falling back to synthetic kernels: {exc}")
-    rng = random.Random(0xA17 ^ n ^ F)
-    return [[[rng.randint(-50, 50) for _ in range(F)] for _ in range(F)]
-            for _ in range(n)]
+            cocotb.log.warning(f"falling back to synthetic kernel: {exc}")
+    rng = random.Random(0xA17 ^ F)
+    return [[rng.randint(-50, 50) for _ in range(F)] for _ in range(F)]
 
 
 @cocotb.test()
-async def test_v2_mobilenet_multilane(dut):
-    """V2 PE end-to-end with NUM_MULTS distinct kernels packed into one PE.
-
-    Each lane gets its own MobileNet red-channel filter; the FIFO-B is the
-    union-WSP-gated stream from fm.goSPA_route. Every lane's E x E output
-    is checked against conv2d_reference(act, that lane's kernel)."""
+async def test_mobilenet(dut):
+    """V2 PE end-to-end with a real MobileNet red-channel filter: sparse
+    activation routed and packed into M-wide beats, output checked vs dense conv."""
     cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
-
     rng = random.Random(0xBEEF + H * 17 + F * 31)
     act = _make_sparse_activation(rng, density=0.5)
-    kernels = _load_mobilenet_kernels(NUM_MULTS)
-    assert len(kernels) == NUM_MULTS, f"need {NUM_MULTS} kernels, got {len(kernels)}"
+    ker = _load_mobilenet_kernel()
 
-    golden = [fm.conv2d_reference(act, ker, S) for ker in kernels]
-    fifo_b, per_lane_sw, per_lane_wsp = route_v2_one_pe(act, kernels)
+    fifo_b, sw = route_single_pe(act, ker)
     n_nz = sum(1 for row in act for v in row if v != 0)
     dut._log.info(
-        f"V2 PE: NUM_MULTS={NUM_MULTS} kernels, H={H} F={F} S={S} E={E}, "
-        f"{n_nz} input non-zeros, {len(fifo_b)} FIFO-B entries, "
-        f"per-lane #weights={[len(s) for s in per_lane_sw]}"
-    )
-
-    await reset(dut)
-    await load_weights_multi(dut, per_lane_sw, per_lane_wsp)
-    await stream_fifo_b(dut, fifo_b)
-    got = await drain_all_lanes(dut)
-
-    mismatches = 0
-    for k in range(NUM_MULTS):
-        out_k = [[got[k].get(r * E + c, 0) for c in range(E)] for r in range(E)]
-        if out_k != golden[k]:
-            mismatches += 1
-            dut._log.error(
-                f"lane#{k} mismatch: kernel={kernels[k]}\n"
-                f"  golden[:3] = {golden[k][:3]}\n"
-                f"  got   [:3] = {out_k[:3]}"
-            )
-    if mismatches:
-        raise AssertionError(
-            f"{mismatches}/{NUM_MULTS} lanes mismatched against conv2d_reference")
-
-    dut._log.info(f"PASS -- all {NUM_MULTS} lanes match conv2d_reference for their kernel")
+        f"V2 PE mobilenet: H={H} F={F} S={S} E={E}, {n_nz} input non-zeros, "
+        f"{len(fifo_b)} FIFO-B entries, {len(pack_beats(fifo_b, NUM_MULTS))} beats, "
+        f"#weights={len(sw)}")
+    await run_case(dut, act, ker, "mobilenet")

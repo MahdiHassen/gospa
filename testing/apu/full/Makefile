@@ -23,35 +23,35 @@ RTL_DIR   := $(REPO_ROOT)/rtl
 
 VERILOG_SOURCES := $(RTL_DIR)/common/fifo.sv \
                    $(RTL_DIR)/common/sram.sv \
-                   $(RTL_DIR)/apu/stage1/zero_act.sv \
                    $(RTL_DIR)/apu/stage1/position_encode.sv \
                    $(RTL_DIR)/apu/stage1/idgen.sv \
                    $(RTL_DIR)/apu/stage1/apu_stage1.sv \
                    $(RTL_DIR)/apu/stage2/routing.sv \
                    $(RTL_DIR)/apu/stage2/apu_stage2.sv \
                    $(RTL_DIR)/apu/act_sram_scanner.sv \
-                   $(RTL_DIR)/apu/wsp_file.sv \
                    $(RTL_DIR)/apu/apu.sv
 
 # -- Functional-model import: the TB does `import functional` from sw/ -------
 export PYTHONPATH := $(REPO_ROOT)/sw:$(PYTHONPATH)
 
 # -- Layer config (override on the command line) -----------------------------
-H      ?= 8
-F      ?= 3
-S      ?= 1
-N_PE   ?= 4
-N_ROWS ?= $(H)             # SRAM depth in rows; default = H (fits one channel)
+H         ?= 8
+F         ?= 3
+S         ?= 1
+N_PE      ?= 4
+NUM_MULTS ?= 4
+N_ROWS    ?= $(H)          # SRAM depth in rows; default = H (fits one channel)
 
 ifeq ($(SIM),icarus)
     COMPILE_ARGS += -g2012 -gsupported-assertions \
                     -Papu.H=$(H) -Papu.F=$(F) -Papu.S=$(S) \
-                    -Papu.N_PE=$(N_PE) -Papu.N_ROWS=$(N_ROWS)
+                    -Papu.N_PE=$(N_PE) -Papu.NUM_MULTS=$(NUM_MULTS) -Papu.N_ROWS=$(N_ROWS)
 endif
 FIFO_D ?= 64
 
 ifeq ($(SIM),verilator)
-    COMPILE_ARGS += -GH=$(H) -GF=$(F) -GS=$(S) -GN_PE=$(N_PE) -GN_ROWS=$(N_ROWS) \
+    COMPILE_ARGS += -GH=$(H) -GF=$(F) -GS=$(S) -GN_PE=$(N_PE) \
+                    -GNUM_MULTS=$(NUM_MULTS) -GN_ROWS=$(N_ROWS) \
                     -GN_NZ_MAX=$(or $(N_NZ_MAX),1024) -GFIFO_D=$(FIFO_D)
     EXTRA_ARGS   += --timing -Wall \
                     --Wno-UNOPTFLAT --Wno-WIDTH --Wno-TIMESCALEMOD \
@@ -77,6 +77,7 @@ export H
 export F
 export S
 export N_PE
+export NUM_MULTS
 export N_ROWS
 
 include $(shell cocotb-config --makefiles)/Makefile.sim

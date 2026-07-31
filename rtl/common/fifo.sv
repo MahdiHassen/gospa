@@ -1,169 +1,152 @@
-// =============================================================================
-// fifo.sv -- Parameterized Synchronous FIFO (block-RAM friendly)
-// =============================================================================
-// GoSPA Project -- Team 19, ECE 720 (Spring 2026)
-//
-// In GoSPA this module is instantiated as:
-//
-//   FIFO-A (one per PID slot, F^2 total):
-//     DATA_WIDTH = ACT_W + CID_W   (e.g. 16+6 = 22 bits)
-//     DEPTH      = 64
-//     Payload    = { act_value[ACT_W-1:0], cid[CID_W-1:0] }
-//     PID is implicit - it is the array index, never stored inside.
-//
-//   FIFO-B (one per PE, N_PE total):
-//     DATA_WIDTH = ACT_W + PID_W + CID_W   (e.g. 16+4+6 = 26 bits)
-//     DEPTH      = 64
-//     Payload    = { act_value[ACT_W-1:0], pid[PID_W-1:0], cid[CID_W-1:0] }
-//
-// Interface: AXI-Stream style valid/ready handshake on both ports, with
-// FIRST-WORD-FALL-THROUGH read semantics -- whenever rd_valid is high, rd_data
-// already holds the head, and asserting rd_ready pops it that same cycle. The
-// downstream consumers depend on this (routing.sv advances FIFO-A lanes on
-// rd_valid going low, and the PE MACs combinationally off rd_data).
-//
-// --- Storage: synchronous write + REGISTERED read (maps to block RAM) --------
-// The bulk storage is a simple dual-port RAM with a synchronous write port and
-// a registered (1-cycle latency) read port -- the template FPGA synthesis maps
-// to a block RAM. An older revision used an asynchronous (combinational) read
-// (`rd_data = mem[rd_ptr]`), which forced LUT-RAM / flop arrays and never hit a
-// BRAM; at DEPTH=2048 that was a large area/timing problem.
-//
-// To keep the FWFT interface on top of a 1-cycle RAM, a small register-based
-// "show-ahead" output buffer (OBUF_D entries) sits in front of the RAM. It is
-// kept primed by issuing RAM reads whenever the RAM holds data and the buffer
-// (plus any in-flight read) has room, so the head is continuously presented and
-// rd_valid never glitches low while data remains. OBUF_D=4 (>=3) is enough to
-// hide the 2-stage read pipeline (RAM output reg -> buffer load) without a
-// bubble under back-to-back pops -- see the analysis in the read path below.
-//
-// Latency note vs. the old async-read FIFO: a word written into an EMPTY FIFO
-// becomes visible on rd_data a couple of cycles later (RAM read + buffer load)
-// instead of next cycle. `count` still reflects total occupancy immediately, so
-// almost_empty (count==1) stays exact; consumers only ever act on a word when
-// rd_valid is high, so the extra fill latency is transparent to them.
-//
-// Constraints:
-//   - DEPTH must be a power of 2 (pointer wrap-around relies on natural overflow).
-//   - Simultaneous push and pop are fully supported at any occupancy.
-//   - Overflow  (push when full) : wr_ready is de-asserted; push is dropped.
-//   - Underflow (pop when empty) : rd_valid is de-asserted; rd_data is stale.
-// =============================================================================
-
 `default_nettype none
 
 module fifo #(
     parameter int DATA_WIDTH = 22,   // payload width in bits
-    parameter int DEPTH      = 64    // number of entries; MUST be a power of 2
+    parameter int DEPTH      = 64,   // number of entries; MUST be a power of 2
+    parameter int PORT_WIDTH = 1     // entries pushed/popped per cycle; power of 2, must divide DEPTH
 ) (
-    input  wire  logic                    clk,
-    input  wire  logic                    rst_n,    // active-low synchronous reset
+    input  wire  logic                              clk,
+    input  wire  logic                              rst_n,    // active-low synchronous reset
 
     // ---- Write / Producer port -----------------------------------------------
-    input  wire  logic                    wr_valid,  // producer presents valid data
-    input  wire  logic [DATA_WIDTH-1:0]   wr_data,
-    output logic                          wr_ready,  // FIFO can accept (not full)
+    input  wire  logic [PORT_WIDTH-1:0]             wr_valid,  // lane i valid; contiguous prefix from 0
+    input  wire  logic [PORT_WIDTH-1:0][DATA_WIDTH-1:0] wr_data,
+    output logic                                    wr_ready,  // FIFO can accept a full PORT_WIDTH-wide push
 
     // ---- Read / Consumer port ------------------------------------------------
-    output logic                          rd_valid,  // FIFO has data (not empty)
-    output logic [DATA_WIDTH-1:0]         rd_data,
-    input  wire  logic                    rd_ready,  // consumer accepts this cycle
+    output logic [PORT_WIDTH-1:0]                   rd_valid,  // thermometer-coded from lane 0
+    output logic [PORT_WIDTH-1:0][DATA_WIDTH-1:0]   rd_data,
+    input  wire  logic [PORT_WIDTH-1:0]             rd_ready,  // contiguous pop request from lane 0
 
     // ---- Status --------------------------------------------------------------
-    output logic                          full,
-    output logic                          empty,
-    output logic [$clog2(DEPTH):0]        count      // occupancy: 0 .. DEPTH
+    output logic                                    full,
+    output logic                                    empty,
+    output logic [$clog2(DEPTH):0]                  count      // occupancy: 0 .. DEPTH
 );
 
-    // -------------------------------------------------------------------------
-    // Derived widths
-    // -------------------------------------------------------------------------
-    localparam int PTR_W   = $clog2(DEPTH);   // RAM pointer width (e.g. 6 for DEPTH=64)
-    localparam int CNT_W   = PTR_W + 1;       // occupancy width (represent 0..DEPTH)
+    localparam int PTR_WIDTH         = $clog2(DEPTH);          // global entry-pointer width
+    localparam int COUNT_WIDTH       = PTR_WIDTH + 1;           // occupancy width (represent 0..DEPTH)
+    localparam int BANK_DEPTH        = DEPTH / PORT_WIDTH;      // entries per physical bank
+    localparam int BANK_ADDR_WIDTH   = $clog2(BANK_DEPTH);      // per-bank RAM address width
+    localparam int PORT_COUNT_WIDTH  = $clog2(PORT_WIDTH + 1);  // width to represent 0..PORT_WIDTH
+    localparam int LANE_INDEX_WIDTH  = (PORT_WIDTH > 1) ? $clog2(PORT_WIDTH) : 1; // width to index a PORT_WIDTH-wide vector
 
-    // Output show-ahead buffer: register FIFO that restores fall-through on top
-    // of the 1-cycle RAM read. Depth 4 (power of 2) >= 3 hides the read pipeline
-    // so the head stays continuously valid under back-to-back pops.
-    localparam int OBUF_D   = 4;
-    localparam int OBPTR_W  = $clog2(OBUF_D); // 2
-    localparam int OBCNT_W  = OBPTR_W + 1;    // represent 0..OBUF_D
+    // Output show-ahead buffer
+    localparam int OBUF_DEPTH        = 4 * PORT_WIDTH;
+    localparam int OBUF_PTR_WIDTH    = $clog2(OBUF_DEPTH);
+    localparam int OBUF_COUNT_WIDTH  = OBUF_PTR_WIDTH + 1;
 
-    // -------------------------------------------------------------------------
-    // Deep storage: synchronous write, registered read => infers block RAM.
-    // -------------------------------------------------------------------------
-    logic [DATA_WIDTH-1:0] mem [0:DEPTH-1];
-    logic [DATA_WIDTH-1:0] mem_q;             // BRAM output register (1-cycle read)
 
-    logic [PTR_W-1:0]      wr_ptr;            // RAM write pointer
-    logic [PTR_W-1:0]      rd_ptr;            // RAM read-issue pointer
-    logic [CNT_W-1:0]      cnt;               // TOTAL occupancy (RAM + in-flight + obuf)
-    logic [CNT_W-1:0]      ram_cnt;           // words resident in RAM, not yet read-issued
-    logic                  rd_en_q;           // a RAM read was issued last cycle (mem_q valid now)
+    logic [DATA_WIDTH-1:0] mem   [0:PORT_WIDTH-1][0:BANK_DEPTH-1];
+    logic [DATA_WIDTH-1:0] mem_q [0:PORT_WIDTH-1];             // per-bank RAM output register
 
-    // -------------------------------------------------------------------------
-    // Show-ahead output buffer: small register FIFO fed by the RAM read.
-    // -------------------------------------------------------------------------
-    logic [DATA_WIDTH-1:0] obuf [0:OBUF_D-1];
-    logic [OBPTR_W-1:0]    ob_head, ob_tail;
-    logic [OBCNT_W-1:0]    ob_cnt;
+    logic [PTR_WIDTH-1:0]      wr_ptr;         // RAM write-issue pointer (global entry index)
+    logic [PTR_WIDTH-1:0]      rd_ptr;         // RAM read-issue pointer (global entry index)
+    logic [COUNT_WIDTH-1:0]    cnt;            // TOTAL occupancy (RAM + in-flight + obuf)
+    logic [COUNT_WIDTH-1:0]    ram_cnt;        // words resident in RAM, not yet read-issued
 
-    // -------------------------------------------------------------------------
+    logic [PTR_WIDTH-1:0]       write_base;    // wr_ptr's phase within a PORT_WIDTH bank group
+    logic [PTR_WIDTH-1:0]       read_base;     // rd_ptr's phase within a PORT_WIDTH bank group
+    logic [PTR_WIDTH-1:0]       read_base_q;   // read_base at the time the in-flight read was issued
+    logic [PORT_COUNT_WIDTH-1:0] mem_rd_cnt;   // banks read-issued this cycle
+    logic [PORT_COUNT_WIDTH-1:0] rd_cnt_q;     // banks read-issued last cycle (landing in mem_q now)
+
+    // Show-ahead output buffer: small register FIFO fed by the banked reads.
+    logic [DATA_WIDTH-1:0] obuf [0:OBUF_DEPTH-1];
+    logic [OBUF_PTR_WIDTH-1:0] ob_head, ob_tail;
+    logic [OBUF_COUNT_WIDTH-1:0] ob_cnt;
+
     // Handshake qualifiers
-    // -------------------------------------------------------------------------
-    logic do_push, do_pop, mem_rd_en;
-
-    assign wr_ready = (cnt != CNT_W'(DEPTH));
-    assign full     = (cnt == CNT_W'(DEPTH));
-    assign empty    = (cnt == '0);
-    assign count    = cnt;
-
-    assign rd_valid = (ob_cnt != '0);         // head present iff output buffer non-empty
-    assign rd_data  = obuf[ob_head];
-
-    assign do_push  = wr_valid & wr_ready;
-    assign do_pop   = rd_valid & rd_ready;
-
-    // Issue a RAM read when the RAM holds data AND the read-side path
-    // (output buffer + the at-most-one in-flight read) still has room. With the
-    // gate `rsv < OBUF_D`, the committed read-side count rsv = ob_cnt + in-flight
-    // is bounded by OBUF_D, so the buffer never overflows and -- because
-    // OBUF_D >= 3 -- never underflows mid-stream either.
-    logic [OBCNT_W-1:0] rsv;
-    assign rsv       = ob_cnt + OBCNT_W'(rd_en_q);
-    assign mem_rd_en = (ram_cnt != '0) && (rsv < OBCNT_W'(OBUF_D));
+    logic                          do_push;      // this cycle's push (if any) is accepted in full
+    logic [PORT_COUNT_WIDTH-1:0]   wr_push_cnt;  // lanes requested by the producer this cycle
+    logic [PORT_COUNT_WIDTH-1:0]   rd_pop_cnt;   // lanes requested by the consumer this cycle
+    logic [COUNT_WIDTH-1:0]        room;         // free slots (DEPTH - cnt)
 
     // -------------------------------------------------------------------------
-    // Next-state occupancy counters (split +1/-1 so widths stay clean)
+    // Lane popcount: counts a contiguous prefix, used for both wr_valid and
+    // rd_ready (occupancy math needs "how many", not which individual bits).
     // -------------------------------------------------------------------------
-    logic [CNT_W-1:0]  cnt_n, ram_cnt_n;
-    logic [OBCNT_W-1:0] ob_cnt_n;
-
-    always_comb begin
-        cnt_n = cnt;
-        if      (do_push && !do_pop) cnt_n = cnt + CNT_W'(1);
-        else if (!do_push && do_pop) cnt_n = cnt - CNT_W'(1);
-
-        ram_cnt_n = ram_cnt;
-        if      (do_push && !mem_rd_en) ram_cnt_n = ram_cnt + CNT_W'(1);
-        else if (!do_push && mem_rd_en) ram_cnt_n = ram_cnt - CNT_W'(1);
-
-        ob_cnt_n = ob_cnt;
-        if      (rd_en_q && !do_pop) ob_cnt_n = ob_cnt + OBCNT_W'(1);
-        else if (!rd_en_q && do_pop) ob_cnt_n = ob_cnt - OBCNT_W'(1);
-    end
+    function automatic logic [PORT_COUNT_WIDTH-1:0] count_ones(input logic [PORT_WIDTH-1:0] bits);
+        logic [PORT_COUNT_WIDTH-1:0] total;
+        total = '0;
+        for (int i = 0; i < PORT_WIDTH; i++) begin
+            if (bits[LANE_INDEX_WIDTH'(i)]) begin
+                total = total + PORT_COUNT_WIDTH'(1);
+            end
+        end
+        return total;
+    endfunction
 
     // -------------------------------------------------------------------------
-    // RAM write port (synchronous)
+    // Write side: one bank instance per lane slot. lane_idx rotates with
+    // write_base so that PORT_WIDTH consecutive global indices map bijectively
+    // onto the PORT_WIDTH physical banks.
     // -------------------------------------------------------------------------
-    always_ff @(posedge clk) begin
-        if (do_push) mem[wr_ptr] <= wr_data;
-    end
+    genvar wbank;
+    generate
+        for (wbank = 0; wbank < PORT_WIDTH; wbank++) begin : g_write_bank
+            logic [PTR_WIDTH-1:0]       lane_idx;
+            logic                       write_enable;
+            logic [BANK_ADDR_WIDTH-1:0] write_addr;
+
+            always_comb begin
+                lane_idx     = (PTR_WIDTH'(wbank) + PTR_WIDTH'(PORT_WIDTH) - write_base) % PTR_WIDTH'(PORT_WIDTH);
+                write_enable = do_push && wr_valid[LANE_INDEX_WIDTH'(lane_idx)];
+                write_addr   = BANK_ADDR_WIDTH'((wr_ptr + lane_idx) / PTR_WIDTH'(PORT_WIDTH));
+            end
+
+            always_ff @(posedge clk) begin
+                if (write_enable) begin
+                    mem[wbank][write_addr] <= wr_data[LANE_INDEX_WIDTH'(lane_idx)];
+                end
+            end
+        end
+    endgenerate
 
     // -------------------------------------------------------------------------
-    // RAM read port (registered output -> block-RAM output register)
+    // Read side: one bank instance per lane slot, gated by mem_rd_cnt (how
+    // many banks may issue a read this cycle).
     // -------------------------------------------------------------------------
-    always_ff @(posedge clk) begin
-        if (mem_rd_en) mem_q <= mem[rd_ptr];
+    genvar rbank;
+    generate
+        for (rbank = 0; rbank < PORT_WIDTH; rbank++) begin : g_read_bank
+            logic [PTR_WIDTH-1:0]       lane_idx;
+            logic                       read_enable;
+            logic [BANK_ADDR_WIDTH-1:0] read_addr;
+
+            always_comb begin
+                lane_idx    = (PTR_WIDTH'(rbank) + PTR_WIDTH'(PORT_WIDTH) - read_base) % PTR_WIDTH'(PORT_WIDTH);
+                read_enable = (int'(lane_idx) < int'(mem_rd_cnt));
+                read_addr   = BANK_ADDR_WIDTH'((rd_ptr + lane_idx) / PTR_WIDTH'(PORT_WIDTH));
+            end
+
+            always_ff @(posedge clk) begin
+                if (read_enable) begin
+                    mem_q[rbank] <= mem[rbank][read_addr];
+                end
+            end
+        end
+    endgenerate
+
+    // -------------------------------------------------------------------------
+    // How many bank reads to issue this cycle: bounded by data available in
+    // RAM, the port width, and room left in the read pipeline + output buffer.
+    // -------------------------------------------------------------------------
+    always_comb begin : compute_mem_rd_cnt
+        int unsigned reserved;
+        int unsigned slack;
+        int unsigned candidate;
+
+        reserved  = int'(ob_cnt) + int'(rd_cnt_q);
+        slack     = (OBUF_DEPTH > reserved) ? (OBUF_DEPTH - reserved) : 0;
+        candidate = int'(ram_cnt);
+        if (candidate > PORT_WIDTH) begin
+            candidate = PORT_WIDTH;
+        end
+        if (candidate > slack) begin
+            candidate = slack;
+        end
+        mem_rd_cnt = PORT_COUNT_WIDTH'(candidate);
     end
 
     // -------------------------------------------------------------------------
@@ -171,34 +154,68 @@ module fifo #(
     // -------------------------------------------------------------------------
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            wr_ptr  <= '0;
-            rd_ptr  <= '0;
-            cnt     <= '0;
-            ram_cnt <= '0;
-            rd_en_q <= 1'b0;
-            ob_head <= '0;
-            ob_tail <= '0;
-            ob_cnt  <= '0;
+            wr_ptr      <= '0;
+            rd_ptr      <= '0;
+            cnt         <= '0;
+            ram_cnt     <= '0;
+            rd_cnt_q    <= '0;
+            read_base_q <= '0;
+            ob_head     <= '0;
+            ob_tail     <= '0;
+            ob_cnt      <= '0;
         end else begin
-            if (do_push)   wr_ptr <= wr_ptr + PTR_W'(1);
-            if (mem_rd_en) rd_ptr <= rd_ptr + PTR_W'(1);
+            wr_ptr <= wr_ptr + (do_push ? PTR_WIDTH'(wr_push_cnt) : PTR_WIDTH'(0));
+            rd_ptr <= rd_ptr + PTR_WIDTH'(mem_rd_cnt);
 
-            cnt     <= cnt_n;
-            ram_cnt <= ram_cnt_n;
-            ob_cnt  <= ob_cnt_n;
+            cnt     <= cnt + (do_push ? COUNT_WIDTH'(wr_push_cnt) : COUNT_WIDTH'(0)) - COUNT_WIDTH'(rd_pop_cnt);
+            ram_cnt <= ram_cnt + (do_push ? COUNT_WIDTH'(wr_push_cnt) : COUNT_WIDTH'(0)) - COUNT_WIDTH'(mem_rd_cnt);
 
-            // A RAM read issued this cycle lands in mem_q next cycle.
-            rd_en_q <= mem_rd_en;
+            // A bank read issued this cycle lands in mem_q next cycle; remember
+            // how many and which rotation phase so it can be un-rotated below.
+            rd_cnt_q    <= mem_rd_cnt;
+            read_base_q <= read_base;
 
-            // Output buffer: append the just-landed RAM word at the tail,
-            // pop the head when the consumer accepts. Both may occur together.
-            if (rd_en_q) begin
-                obuf[ob_tail] <= mem_q;
-                ob_tail       <= ob_tail + OBPTR_W'(1);
+            // Output buffer: append the just-landed bank words (un-rotated back
+            // to linear order) at the tail, advance the head by however many the
+            // consumer accepted this cycle. Both may occur together.
+            for (int j = 0; j < PORT_WIDTH; j++) begin
+                if (j < int'(rd_cnt_q)) begin
+                    obuf[ob_tail + OBUF_PTR_WIDTH'(j)] <= mem_q[(int'(read_base_q) + j) % PORT_WIDTH];
+                end
             end
-            if (do_pop) ob_head <= ob_head + OBPTR_W'(1);
+            ob_tail <= ob_tail + OBUF_PTR_WIDTH'(rd_cnt_q);
+            ob_head <= ob_head + OBUF_PTR_WIDTH'(rd_pop_cnt);
+            ob_cnt  <= ob_cnt + OBUF_COUNT_WIDTH'(rd_cnt_q) - OBUF_COUNT_WIDTH'(rd_pop_cnt);
         end
     end
+
+    // -------------------------------------------------------------------------
+    // Consumer-facing show-ahead window: lane j exposes obuf[head+j], valid
+    // while j is within the current output-buffer occupancy.
+    // -------------------------------------------------------------------------
+    always_comb begin : present_read_window
+        for (int j = 0; j < PORT_WIDTH; j++) begin
+            rd_valid[LANE_INDEX_WIDTH'(j)] = (j < int'(ob_cnt));
+            rd_data[LANE_INDEX_WIDTH'(j)]  = obuf[ob_head + OBUF_PTR_WIDTH'(j)];
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // Continuous assignments
+    // -------------------------------------------------------------------------
+    assign wr_push_cnt = count_ones(wr_valid);
+    assign rd_pop_cnt  = count_ones(rd_ready & rd_valid);
+
+    assign write_base = wr_ptr % PTR_WIDTH'(PORT_WIDTH);
+    assign read_base  = rd_ptr % PTR_WIDTH'(PORT_WIDTH);
+
+    assign room     = COUNT_WIDTH'(DEPTH) - cnt;
+    assign wr_ready = (room >= COUNT_WIDTH'(PORT_WIDTH));
+    assign do_push  = wr_ready;
+
+    assign full  = (cnt == COUNT_WIDTH'(DEPTH));
+    assign empty = (cnt == '0);
+    assign count = cnt;
 
 `ifndef SYNTHESIS
     // -------------------------------------------------------------------------
@@ -206,11 +223,15 @@ module fifo #(
     // -------------------------------------------------------------------------
     always_ff @(posedge clk) begin
         if (rst_n) begin
-            assert (ob_cnt <= OBCNT_W'(OBUF_D))
+            for (int i = 1; i < PORT_WIDTH; i++) begin
+                assert (!(wr_valid[LANE_INDEX_WIDTH'(i)] && !wr_valid[LANE_INDEX_WIDTH'(i-1)]))
+                    else $error("fifo: wr_valid must be a contiguous prefix from lane 0");
+                assert (!(rd_ready[LANE_INDEX_WIDTH'(i)] && !rd_ready[LANE_INDEX_WIDTH'(i-1)]))
+                    else $error("fifo: rd_ready must be a contiguous prefix from lane 0");
+            end
+            assert (ob_cnt <= OBUF_COUNT_WIDTH'(OBUF_DEPTH))
                 else $error("fifo: output buffer overflow ob_cnt=%0d", ob_cnt);
-            assert (!(do_pop && ob_cnt == '0))
-                else $error("fifo: pop while output buffer empty");
-            assert (cnt <= CNT_W'(DEPTH))
+            assert (cnt <= COUNT_WIDTH'(DEPTH))
                 else $error("fifo: occupancy overflow cnt=%0d", cnt);
         end
     end

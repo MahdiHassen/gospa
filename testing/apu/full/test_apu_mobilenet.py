@@ -11,8 +11,8 @@ What this test exercises end-to-end
    32 output filters.
 2. Bundles 32 kernels into 8 PE chunks of 4 (V2). For each chunk the host
    computes the UNION WSP -- the per-PE bit pattern that gates routing.
-3. Loads each PE's union WSP into the APU's on-chip wsp_file via the
-   write port (one PE per cycle).
+3. Drives each PE's union WSP straight onto the APU's per-PE wsp input
+   (models the PE array's exported WSP; LSB-first by PID).
 4. Generates a synthetic sparse INT8 activation (raw H x H, padded to
    (H+2) x (H+2) to mimic padding=1) and encodes it as CSR into the
    activation SRAM via the entry + row_ptr fill ports.
@@ -74,8 +74,14 @@ IDX_W   = 1 if H              < 2 else _clog2(H)
 PTR_W   = 1 if (N_NZ_MAX + 1) < 2 else _clog2(N_NZ_MAX + 1)
 ENT_AW  = 1 if N_NZ_MAX       < 2 else _clog2(N_NZ_MAX)
 RPTR_AW = 1 if (N_ROWS + 1)   < 2 else _clog2(N_ROWS + 1)
-FIFOB_W = DATA_W + PID_W + CID_W
+NUM_MULTS = int(os.environ.get("NUM_MULTS", str(N_MULTS)))   # FIFO-B beat width
 CLK_NS  = 10
+
+
+def _field(binstr, lsb, width):
+    """Extract unsigned field [lsb +: width] from a packed-vector binstr."""
+    L = len(binstr)
+    return int(binstr[L - lsb - width : L - lsb], 2)
 
 # ---------------------------------------------------------------------------
 # Load MobileNetV2 first-conv weights ONCE (module-level so cocotb startup
@@ -103,11 +109,14 @@ UNION_WSPS = [fm.wsp_union([_per_kernel_wsps[k] for k in c]) for c in _pe_chunks
 # ---------------------------------------------------------------------------
 # Helpers (shared shape with test_apu.py)
 # ---------------------------------------------------------------------------
-def _pack_one_wsp(wsp_per_pe):
+def _pack_wsps(wsps):
+    """Pack the full wsp[N_PE][N_PID] input, LSB-first by PID (matches pe.wsp).
+    `wsps` is list[<=N_PE][N_PID]; missing PE entries default to all-zero."""
     val = 0
-    for p in range(N_PID):
-        if wsp_per_pe[p]:
-            val |= 1 << (N_PID - 1 - p)
+    for k in range(min(len(wsps), N_PE)):
+        for p in range(N_PID):
+            if wsps[k][p]:
+                val |= 1 << (k * N_PID + p)
     return val
 
 
@@ -147,9 +156,7 @@ async def reset(dut):
     dut.scan_n_rows.value       = 0
     dut.scan_base_row.value     = 0
     dut.s2_start.value          = 0
-    dut.wsp_we.value            = 0
-    dut.wsp_waddr.value         = 0
-    dut.wsp_wdata.value         = 0
+    dut.wsp.value               = 0
     dut.fifob_rd_ready.value    = 0
     for _ in range(4):
         await RisingEdge(dut.clk)
@@ -158,19 +165,9 @@ async def reset(dut):
 
 
 async def load_wsps(dut, wsps):
-    """Write up to N_PE per-PE WSPs into wsp_file (one PE per cycle).
+    """Drive the per-PE WSP input directly (models the PE array's wsp export).
     `wsps` is list[<=N_PE][N_PID]; missing PE entries default to all-zero."""
-    dut.wsp_we.value = 1
-    for k in range(N_PE):
-        dut.wsp_waddr.value = k
-        if k < len(wsps):
-            dut.wsp_wdata.value = _pack_one_wsp(wsps[k])
-        else:
-            dut.wsp_wdata.value = 0
-        await RisingEdge(dut.clk)
-    dut.wsp_we.value    = 0
-    dut.wsp_waddr.value = 0
-    dut.wsp_wdata.value = 0
+    dut.wsp.value = _pack_wsps(wsps)
     await RisingEdge(dut.clk)
 
 
@@ -247,23 +244,30 @@ async def run_stage2_and_drain(dut, timeout=400000):
         await ReadOnly()
         vbits = int(dut.fifob_rd_valid.value)
         if vbits != 0:
-            binstr = dut.fifob_rd_data.value.binstr
-            L = len(binstr)
+            pid_s = str(dut.fifob_rd_pid.value)
+            lv_s  = str(dut.fifob_rd_lane_valid.value)
+            act_s = str(dut.fifob_rd_act.value)
+            cid_s = str(dut.fifob_rd_cid.value)
             for k in range(N_PE):
                 if (vbits >> k) & 1:
-                    field = binstr[L - (k + 1) * FIFOB_W : L - k * FIFOB_W]
-                    payload = int(field, 2)
-                    cid = payload & ((1 << CID_W) - 1)
-                    pid = (payload >> CID_W) & ((1 << PID_W) - 1)
-                    axy = (payload >> (CID_W + PID_W)) & ((1 << DATA_W) - 1)
-                    collected[k].append((axy, pid, cid))
+                    pid = _field(pid_s, k * PID_W, PID_W)
+                    for i in range(NUM_MULTS):
+                        lane = k * NUM_MULTS + i
+                        if _field(lv_s, lane, 1):
+                            axy = _field(act_s, lane * DATA_W, DATA_W)
+                            cid = _field(cid_s, lane * CID_W, CID_W)
+                            collected[k].append((axy, pid, cid))
         if int(dut.s2_done.value) == 1:
             seen_done = True
         await RisingEdge(dut.clk)
+        # Beats take a few cycles to surface through FIFO-B's show-ahead after
+        # s2_done; wait for a run of consecutive idle cycles before stopping.
         if seen_done and vbits == 0:
             drain_extra += 1
-            if drain_extra >= 2:
+            if drain_extra >= 8:
                 break
+        else:
+            drain_extra = 0
         guard += 1
 
     dut.fifob_rd_ready.value = 0
