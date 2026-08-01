@@ -20,6 +20,8 @@ RTL_DIR   := $(REPO_ROOT)/rtl
 
 VERILOG_SOURCES := $(RTL_DIR)/common/fifo.sv \
                    $(RTL_DIR)/common/sram.sv \
+                   $(RTL_DIR)/common/arith/rca_add.sv \
+                   $(RTL_DIR)/common/arith/mult_pipe.sv \
                    $(RTL_DIR)/apu/stage1/position_encode.sv \
                    $(RTL_DIR)/apu/stage1/idgen.sv \
                    $(RTL_DIR)/apu/stage1/apu_stage1.sv \
