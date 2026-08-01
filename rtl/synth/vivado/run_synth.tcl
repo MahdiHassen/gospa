@@ -22,7 +22,7 @@
 
 # ---- board / clock ----------------------------------------------------------
 set PART      "xck26-sfvc784-2LV-c"   ;# Kria KV260 (K26 / ZU5EV). Bigger: xcu250-figd2104-2L-e
-set PERIOD_NS 4.000                    ;# target period. 4 ns = 250 MHz. Tighten once met.
+set PERIOD_NS 1.000                    ;# 1 ns = 1 GHz (aggressive: forces the tool to push Fmax).
 set RUN_IMPL  1                        ;# 1 = place & route (real Fmax); 0 = synth-only (quick)
 set TOP       "gospa"
 
