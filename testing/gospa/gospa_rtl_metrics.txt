@@ -1,0 +1,27 @@
+GOSPA RTL METRICS
+N_PE=8 x N_MULTS=4 (32 multipliers)  f_clk=100 MHz  STAGE1_BATCH=16 FILL_W=16 S2_BEATS=16 DRAIN_W=64
+peak = 3.20 GMAC/s; util% = useful MACs / (cycles x 32); wl/s = full workload passes per second
+
+A. DENSITY CLASSES (da = dw; synthetic 32x32, Cin=3, Cout=32 pool)
+ dens   cycles  useMACs  util%  MAC/cyc  lat_us      wl/s
+--------------------------------------------------------
+  0.1     1055    11273   33.4    10.69    10.6    94,787
+  0.2     2524    32461   40.2    12.86    25.2    39,620
+  0.3     4588    69580   47.4    15.17    45.9    21,796
+  0.4     6447   118992   57.7    18.46    64.5    15,511
+  0.5    10691   209406   61.2    19.59   106.9     9,354
+  0.6    13328   284148   66.6    21.32   133.3     7,503
+  0.7    16010   382527   74.7    23.89   160.1     6,246
+  0.8    19131   486360   79.4    25.42   191.3     5,227
+  0.9    22876   635306   86.8    27.77   228.8     4,371
+  1.0    25156   777600   96.6    30.91   251.6     3,975
+
+B. MOBILENETV2 LAYERS (real apple-80 tensors, golden-checked)
+  # type      shape          mode                   useMACs   cycles  util%  lat_ms  GMAC/s
+--------------------------------------------------------------------------------------------
+  0 conv3x3s2 3->32 @80      spatial H=80 F=3 S=2   1027158    44511   72.1   0.445    2.31
+  1 dw3x3s1   32->32 @40     dw-mosaic H=40 S=1      238830    34119   21.9   0.341    0.70
+  5 pw1x1     96->24 @20     chpid W=20 batch=25     552774    20024   86.3   0.200    2.76
+ 33 pw1x1     96->576 @5     chpid W=5 batch=25     1322028    59027   70.0   0.590    2.24
+ 44 pw1x1     960->160 @3    chpid W=3 batch=64      621621    43779   44.4   0.438    1.42
+ 51 pw1x1     320->1280 @3   chpid W=3 batch=64     3562915   183301   60.7   1.833    1.94

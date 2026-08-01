@@ -47,7 +47,13 @@ N_MULTS      ?= 4
 N_ROWS       ?= $(H)
 N_NZ_MAX     ?= 225
 FIFO_D       ?= 64
+FIFOB_D      ?= $(FIFO_D)
 STAGE1_BATCH ?= 4
+FILL_W       ?= 16
+S2_BEATS     ?= 1
+CH_PID       ?= 0
+DW_COLW      ?= 0
+DRAIN_W      ?= 1
 
 # -- Input tiling (sweep only): tile_h x tile_w <= FIFO_D so any H fits fixed
 # on-chip memory. With FIFO_D=128 an 11x11 tile (121 entries) is the largest.
@@ -58,7 +64,11 @@ ifeq ($(SIM),verilator)
     COMPILE_ARGS += -GH=$(H) -GF=$(F) -GS=$(S) \
                     -GN_PE=$(N_PE) -GN_MULTS=$(N_MULTS) \
                     -GN_ROWS=$(N_ROWS) -GN_NZ_MAX=$(N_NZ_MAX) \
-                    -GFIFO_D=$(FIFO_D) -GSTAGE1_BATCH=$(STAGE1_BATCH)
+                    -GFIFO_D=$(FIFO_D) -GFIFOB_D=$(FIFOB_D) \
+                    -GSTAGE1_BATCH=$(STAGE1_BATCH) \
+                    -GFILL_W=$(FILL_W) -GS2_BEATS=$(S2_BEATS) \
+                    -GCH_PID=$(CH_PID) -GDW_COLW=$(DW_COLW) \
+                    -GDRAIN_W=$(DRAIN_W)
     EXTRA_ARGS   += --timing -Wall \
                     --Wno-UNOPTFLAT --Wno-WIDTH --Wno-TIMESCALEMOD \
                     --Wno-DECLFILENAME --Wno-UNUSEDSIGNAL --Wno-EOFNEWLINE \
@@ -70,7 +80,9 @@ ifeq ($(SIM),icarus)
                     -Pgospa.H=$(H) -Pgospa.F=$(F) -Pgospa.S=$(S) \
                     -Pgospa.N_PE=$(N_PE) -Pgospa.N_MULTS=$(N_MULTS) \
                     -Pgospa.N_ROWS=$(N_ROWS) -Pgospa.N_NZ_MAX=$(N_NZ_MAX) \
-                    -Pgospa.FIFO_D=$(FIFO_D) -Pgospa.STAGE1_BATCH=$(STAGE1_BATCH)
+                    -Pgospa.FIFO_D=$(FIFO_D) -Pgospa.STAGE1_BATCH=$(STAGE1_BATCH) \
+                    -Pgospa.FILL_W=$(FILL_W) -Pgospa.S2_BEATS=$(S2_BEATS) \
+                    -Pgospa.CH_PID=$(CH_PID) -Pgospa.DW_COLW=$(DW_COLW)
 endif
 
 ifeq ($(WAVES),1)
@@ -89,6 +101,11 @@ export N_ROWS
 export N_NZ_MAX
 export FIFO_D
 export STAGE1_BATCH
+export FILL_W
+export S2_BEATS
+export CH_PID
+export DW_COLW
+export DRAIN_W
 export TILE_H
 export TILE_W
 
@@ -101,6 +118,38 @@ mobilenet:
 	$(MAKE) -s MODULE=test_gospa SIM=$(SIM) \
 		H=10 F=3 S=2 N_PE=8 N_MULTS=4 \
 		N_ROWS=10 N_NZ_MAX=1024 FIFO_D=2048
+
+# -- Real-workload apple run: MobileNetV2 first conv, 80x80 apple input -------
+# N_PE=8 (default) = 32 mults, 4 group passes; N_PE=32 = one pass, 128 mults.
+# S2_BEATS=4: router outruns the PEs 4x, FIFO-B backlog hides the front end
+# (FIFO_D=4096 so the backlog fits).
+.PHONY: apple
+apple:
+	$(MAKE) -s clean
+	$(MAKE) -s MODULE=test_gospa_apple SIM=$(SIM) \
+		H=80 F=3 S=2 N_PE=$(N_PE) N_MULTS=4 \
+		N_ROWS=80 N_NZ_MAX=8192 FIFO_D=4096 \
+		STAGE1_BATCH=$(STAGE1_BATCH) FILL_W=$(FILL_W) S2_BEATS=4
+
+# -- Real MobileNetV2 layers beyond conv1 (real apple-80 tensors) -------------
+.PHONY: mobilenet_dw1 mobilenet_pw2 mobilenet_pw3
+mobilenet_dw1:
+	$(MAKE) -s clean
+	LAYER_IDX=1 $(MAKE) -s MODULE=test_gospa_mobilenet SIM=$(SIM) \
+		H=40 F=3 S=1 N_PE=8 N_MULTS=4 N_ROWS=40 N_NZ_MAX=2048 FIFO_D=4096 \
+		STAGE1_BATCH=$(STAGE1_BATCH) FILL_W=$(FILL_W) S2_BEATS=4
+
+mobilenet_pw2:
+	$(MAKE) -s clean
+	LAYER_IDX=2 $(MAKE) -s MODULE=test_gospa_mobilenet SIM=$(SIM) \
+		H=40 F=1 S=1 N_PE=8 N_MULTS=4 N_ROWS=40 N_NZ_MAX=2048 FIFO_D=4096 \
+		STAGE1_BATCH=$(STAGE1_BATCH) FILL_W=$(FILL_W) S2_BEATS=4
+
+mobilenet_pw3:
+	$(MAKE) -s clean
+	LAYER_IDX=3 $(MAKE) -s MODULE=test_gospa_mobilenet SIM=$(SIM) \
+		H=40 F=1 S=1 N_PE=8 N_MULTS=4 N_ROWS=40 N_NZ_MAX=2048 FIFO_D=4096 \
+		STAGE1_BATCH=$(STAGE1_BATCH) FILL_W=$(FILL_W) S2_BEATS=4
 
 # -- Base correctness tests (test_gospa.py), single-bank input-tiled ----------
 .PHONY: test_gospa

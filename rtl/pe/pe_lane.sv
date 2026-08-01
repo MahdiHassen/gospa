@@ -24,6 +24,7 @@
 
 module pe_lane #(
     parameter int NUM_CID    = 36,   // # output positions = accumulator depth
+    parameter int DRAIN_W    = 1,    // parallel drain read ports
     parameter int DATA_WIDTH = 16,
     parameter int ACC_WIDTH  = 32,
 
@@ -41,9 +42,10 @@ module pe_lane #(
     output logic                          mac_busy,       // MAC pipeline in flight (drain-flush gate)
     output logic                          mac_fire,       // 1-cycle pulse per accumulate (perf tally)
 
-    // -- Stage-2 drain read port (driven by the PE) --------------------------
-    input  logic [CID_WIDTH-1:0]          drain_idx,      // bank index to read out
-    output logic [ACC_WIDTH-1:0]          drain_val       // acc[drain_idx]
+    // -- Stage-2 drain read ports (driven by the PE). The bank is a flop
+    //    array, so DRAIN_W parallel combinational reads are free. -------------
+    input  logic [DRAIN_W-1:0][CID_WIDTH-1:0] drain_idx,  // bank indices to read
+    output logic [DRAIN_W-1:0][ACC_WIDTH-1:0] drain_val   // acc[drain_idx[i]]
 );
 
     // -------------------------------------------------------------------------
@@ -76,7 +78,9 @@ module pe_lane #(
     // -------------------------------------------------------------------------
     assign mac_busy  = 1'b0;
     assign mac_fire  = mac_go;
-    assign drain_val = acc[drain_idx];
+    always_comb
+        for (int i = 0; i < DRAIN_W; i++)
+            drain_val[i] = ACC_WIDTH'(acc[drain_idx[i]]);
 
 endmodule
 

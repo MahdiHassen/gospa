@@ -24,6 +24,8 @@ module pe #(
     parameter int NUM_MULTS  = 4,    // multipliers = activations consumed per beat
     parameter int NUM_PID    = 9,    // # kernel positions = F*F (max weights)
     parameter int NUM_CID    = 36,   // # output positions = E*E (accumulator depth)
+    parameter int DW_COLW    = 0,    // >0: drain a 2-D window; cid = {row, col}
+    parameter int DRAIN_W    = 1,    // accumulator values drained per cycle
     parameter int DATA_WIDTH = 16,
     parameter int ACC_WIDTH  = 32,
 
@@ -54,12 +56,20 @@ module pe #(
     output logic                                 b_ready,
 
     // -- Drain / output (single CID stream for this PE's output channel) ------
+    // With DW_COLW > 0 the drain walks the 2-D window [r0, r0+rlen) x
+    // [c0, c0+clen) of the {row, col[DW_COLW-1:0]} CID space instead of the
+    // full linear range.
     input  logic                                 drain_start,
+    input  logic [CID_WIDTH-1:0]                 drain_r0,
+    input  logic [CID_WIDTH-1:0]                 drain_c0,
+    input  logic [CID_WIDTH-1:0]                 drain_rlen,
+    input  logic [CID_WIDTH-1:0]                 drain_clen,
     output logic                                 drain_busy,
     output logic                                 drain_done,
     output logic                                 out_valid,
-    output logic [CID_WIDTH-1:0]                 out_cid,
-    output logic [ACC_WIDTH-1:0]                 out_acc,
+    output logic [DRAIN_W-1:0]                   out_lane_valid,
+    output logic [DRAIN_W-1:0][CID_WIDTH-1:0]    out_cid,
+    output logic [DRAIN_W-1:0][ACC_WIDTH-1:0]    out_acc,
     input  logic                                 out_ready
 );
 
@@ -81,16 +91,15 @@ module pe #(
     // not a port, so it does not touch the array/synthesis interface.
     logic [NUM_MULTS-1:0]                   mac_busy;
     logic [NUM_MULTS-1:0]                   mac_fire;
-    logic [NUM_MULTS-1:0][ACC_WIDTH-1:0]    lane_drain_val;
+    logic [NUM_MULTS-1:0][DRAIN_W-1:0][ACC_WIDTH-1:0] lane_drain_val;
 
-    // Drain FSM (single stream out, summing the M banks per CID).
+    // Drain FSM (DRAIN_W-wide stream out, summing the M banks per CID).
     logic                    armed;         // WSP loaded / running
     logic                    draining;
-    logic [CID_WIDTH-1:0]    drain_idx;
+    logic [DRAIN_W-1:0][CID_WIDTH-1:0] drain_idx;
     logic                    drain_req_q;   // latched drain_start
     logic                    start_drain;
     logic                    busy_q;        // drain_busy delayed (done edge)
-    logic signed [ACC_WIDTH-1:0] acc_sum;
 
     // -------------------------------------------------------------------------
     // Submodules
@@ -138,7 +147,8 @@ module pe #(
             assign lane_go = consume && mac_en && b_lane_valid[k] && !draining;
 
             pe_lane #(
-                .NUM_CID(NUM_CID), .DATA_WIDTH(DATA_WIDTH), .ACC_WIDTH(ACC_WIDTH)
+                .NUM_CID(NUM_CID), .DRAIN_W(DRAIN_W),
+                .DATA_WIDTH(DATA_WIDTH), .ACC_WIDTH(ACC_WIDTH)
             ) u_lane (
                 .clk       (clk),
                 .rst_n     (rst_n),
@@ -169,24 +179,72 @@ module pe #(
     end
 
     // -------------------------------------------------------------------------
-    // Drain FSM: stream one CID per accepted beat, summing the M banks.
+    // Drain FSM: stream DRAIN_W CIDs per accepted beat, summing the M banks
+    // per CID. Linear over [0, NUM_CID) by default; 2-D window walk (stepping
+    // DRAIN_W along the column dimension) when DW_COLW > 0.
     // -------------------------------------------------------------------------
-    always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            draining  <= 1'b0;
-            drain_idx <= '0;
-        end else if (!draining) begin
-            if (start_drain) begin
-                draining  <= 1'b1;
-                drain_idx <= '0;
+    generate
+    if (DW_COLW == 0) begin : g_drain_linear
+        logic [CID_WIDTH-1:0] idx_q;
+        always_ff @(posedge clk) begin
+            if (!rst_n) begin
+                draining <= 1'b0;
+                idx_q    <= '0;
+            end else if (!draining) begin
+                if (start_drain) begin
+                    draining <= 1'b1;
+                    idx_q    <= '0;
+                end
+            end else if (out_ready) begin
+                if (32'(idx_q) + DRAIN_W >= NUM_CID)
+                    draining <= 1'b0;
+                else
+                    idx_q <= idx_q + CID_WIDTH'(DRAIN_W);
             end
-        end else if (out_ready) begin
-            if (drain_idx == CID_WIDTH'(NUM_CID-1))
-                draining  <= 1'b0;
-            else
-                drain_idx <= drain_idx + CID_WIDTH'(1);
         end
+        always_comb
+            for (int i = 0; i < DRAIN_W; i++) begin
+                drain_idx[i]      = idx_q + CID_WIDTH'(i);
+                // Sparse drain: only non-zero accumulators are emitted
+                // (consumers default absent CIDs to zero).
+                out_lane_valid[i] = draining && (32'(idx_q) + i < NUM_CID)
+                                    && (out_acc[i] != '0);
+            end
+    end else begin : g_drain_window
+        logic [CID_WIDTH-1:0] r_q, c_q;
+        always_ff @(posedge clk) begin
+            if (!rst_n) begin
+                draining <= 1'b0;
+                r_q      <= '0;
+                c_q      <= '0;
+            end else if (!draining) begin
+                if (start_drain) begin
+                    draining <= 1'b1;
+                    r_q      <= drain_r0;
+                    c_q      <= drain_c0;
+                end
+            end else if (out_ready) begin
+                if (32'(c_q) + DRAIN_W >= 32'(drain_c0) + 32'(drain_clen)) begin
+                    c_q <= drain_c0;
+                    if (r_q == drain_r0 + drain_rlen - CID_WIDTH'(1))
+                        draining <= 1'b0;
+                    else
+                        r_q <= r_q + CID_WIDTH'(1);
+                end else begin
+                    c_q <= c_q + CID_WIDTH'(DRAIN_W);
+                end
+            end
+        end
+        always_comb
+            for (int i = 0; i < DRAIN_W; i++) begin
+                drain_idx[i]      = CID_WIDTH'(r_q << DW_COLW)
+                                    | (c_q + CID_WIDTH'(i));
+                out_lane_valid[i] = draining
+                    && (32'(c_q) + i < 32'(drain_c0) + 32'(drain_clen))
+                    && (out_acc[i] != '0);
+            end
     end
+    endgenerate
 
     always_ff @(posedge clk) begin
         if (!rst_n)
@@ -203,12 +261,16 @@ module pe #(
     end
 
     // -------------------------------------------------------------------------
-    // Combinational: sum the M per-lane banks at the drained CID.
+    // Combinational: sum the M per-lane banks at each drained CID.
     // -------------------------------------------------------------------------
     always_comb begin
-        acc_sum = '0;
-        for (int i = 0; i < NUM_MULTS; i++)
-            acc_sum = acc_sum + $signed(lane_drain_val[i]);
+        for (int d = 0; d < DRAIN_W; d++) begin
+            logic signed [ACC_WIDTH-1:0] s;
+            s = '0;
+            for (int i = 0; i < NUM_MULTS; i++)
+                s = s + $signed(lane_drain_val[i][d]);
+            out_acc[d] = s;
+        end
     end
 
     // -------------------------------------------------------------------------
@@ -223,7 +285,6 @@ module pe #(
     assign drain_done  = busy_q && !drain_busy;
     assign out_valid   = draining;
     assign out_cid     = drain_idx;
-    assign out_acc     = acc_sum;
 
 endmodule
 

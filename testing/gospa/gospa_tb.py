@@ -20,6 +20,11 @@ N_MULTS  = int(os.environ.get("N_MULTS", "4"))       # activation lanes / beat
 N_ROWS   = int(os.environ.get("N_ROWS",   str(H)))
 N_NZ_MAX = int(os.environ.get("N_NZ_MAX", "1024"))
 FIFO_D   = int(os.environ.get("FIFO_D", "64"))
+FILL_W   = int(os.environ.get("FILL_W", "1"))         # CSR fill lanes/cycle
+S2_BEATS = int(os.environ.get("S2_BEATS", "1"))       # router beats/cycle
+CH_PID   = int(os.environ.get("CH_PID", "0"))         # channel-as-PID mode
+DW_COLW  = int(os.environ.get("DW_COLW", "0"))        # dw-mosaic col width
+DRAIN_W  = int(os.environ.get("DRAIN_W", "1"))        # drain lanes / PE / cycle
 DATA_W   = 16
 ACC_W    = 32
 CLK_NS   = 10                                         # 100 MHz sim clock
@@ -36,9 +41,11 @@ def _clog2(n):
 
 E       = (H - F) // S + 1
 N_PID   = F * F
-N_CID   = E * E
+N_CID   = H if CH_PID else E * E      # CH_PID: cid = flattened pixel < H
 CID_W   = max(1, _clog2(N_CID))
 PID_W   = max(1, _clog2(N_PID))
+IDX_W   = max(1, _clog2(H))
+PTR_W   = max(1, _clog2(N_NZ_MAX + 1))
 
 
 # -- Data generation -------------------------------------------------------
@@ -135,32 +142,50 @@ async def reset(dut):
     dut.scan_base_row.value    = 0
     dut.s2_start.value         = 0
     dut.pe_wfill_we.value      = 0
-    dut.pe_wfill_pe.value      = 0
     dut.pe_wfill_pid.value     = 0
     dut.pe_wfill_val.value     = 0
     dut.pe_wload_done.value    = 0
     dut.drain_start.value      = 0
     dut.out_ready.value        = 0
+    dut.dw_en.value            = 0
+    dut.band_r0.value          = 0
+    dut.band_r1.value          = 0
+    dut.band_c0.value          = 0
+    dut.band_c1.value          = 0
+    dut.drain_r0.value         = 0
+    dut.drain_c0.value         = 0
+    dut.drain_rlen.value       = 0
+    dut.drain_clen.value       = 0
     for _ in range(4):
         await RisingEdge(dut.clk)
     dut.rst_n.value = 1
     await RisingEdge(dut.clk)
 
 
-async def load_pe_weights(dut, kernels):
-    """Stream each PE's kernel into its bank, one weight/cycle in PID order.
-    Slot and WSP are derived inside the PE; WSP reaches the router on arm."""
-    import functional as fm
-    dut.pe_wfill_we.value = 1
-    for pe in range(N_PE):
-        _, sparse = fm.kernel_to_sparse(kernels[pe])     # (pid, w) in PID order
-        for (pid, val) in sparse:
-            dut.pe_wfill_pe.value  = pe
-            dut.pe_wfill_pid.value = pid
-            dut.pe_wfill_val.value = _mask(val, DATA_W)
-            await RisingEdge(dut.clk)
+async def load_pe_sparse(dut, sparse_list):
+    """PE-parallel weight fill: one PID per cycle, lane k carries PE k's value.
+    sparse_list[k] = [(pid, w), ...] in PID order (slot/WSP derived inside)."""
+    by_pid = {}
+    for k, sp in enumerate(sparse_list):
+        for (pid, val) in sp:
+            by_pid.setdefault(pid, {})[k] = val
+    for pid in sorted(by_pid):
+        mask = vals = 0
+        for k, v in by_pid[pid].items():
+            mask |= 1 << k
+            vals |= _mask(v, DATA_W) << (k * DATA_W)
+        dut.pe_wfill_we.value  = mask
+        dut.pe_wfill_pid.value = pid
+        dut.pe_wfill_val.value = vals
+        await RisingEdge(dut.clk)
     dut.pe_wfill_we.value = 0
     await RisingEdge(dut.clk)
+
+
+async def load_pe_weights(dut, kernels):
+    """Load each PE's kernel (dense FxF) via the PE-parallel fill port."""
+    import functional as fm
+    await load_pe_sparse(dut, [fm.kernel_to_sparse(k)[1] for k in kernels])
 
 
 async def arm_pe_array(dut):
@@ -172,27 +197,52 @@ async def arm_pe_array(dut):
         await RisingEdge(dut.clk)
 
 
+async def swap_weights(dut, settle=2):
+    """Double-buffered weight-bank swap: the session streamed since the last
+    swap becomes active (1-cycle wload_done pulse + short settle). Only call
+    with the PEs idle (no FIFO-B backlog) -- the exported WSP changes."""
+    dut.pe_wload_done.value = 1
+    await RisingEdge(dut.clk)
+    dut.pe_wload_done.value = 0
+    for _ in range(settle):
+        await RisingEdge(dut.clk)
+
+
 async def fill_activation_csr(dut, matrix):
-    """Encode `matrix` as CSR and stream it into the activation SRAM."""
+    """Encode `matrix` as CSR and stream it into the activation SRAM in
+    FILL_W-wide beats (lane j -> addr + j; we is a contiguous prefix)."""
     import functional as fm
     values, col_idx, row_ptr = fm.dense_to_csr(matrix)
     if len(values) > N_NZ_MAX:
         raise ValueError(f"{len(values)} non-zeros > N_NZ_MAX={N_NZ_MAX}")
 
-    dut.fill_rptr_we.value = 1
     last_ptr = row_ptr[-1]
-    for r in range(N_ROWS + 1):
-        dut.fill_rptr_addr.value = r
-        dut.fill_rptr_data.value = row_ptr[r] if r < len(row_ptr) else last_ptr
+    ptrs = [row_ptr[r] if r < len(row_ptr) else last_ptr
+            for r in range(N_ROWS + 1)]
+    ptr_mask = (1 << PTR_W) - 1
+    for base in range(0, N_ROWS + 1, FILL_W):
+        n = min(FILL_W, N_ROWS + 1 - base)
+        data = 0
+        for i in range(n):
+            data |= (ptrs[base + i] & ptr_mask) << (i * PTR_W)
+        dut.fill_rptr_we.value   = (1 << n) - 1
+        dut.fill_rptr_addr.value = base
+        dut.fill_rptr_data.value = data
         await RisingEdge(dut.clk)
     dut.fill_rptr_we.value = 0
 
     val_mask = (1 << DATA_W) - 1
-    dut.fill_entry_we.value = 1
-    for k in range(len(values)):
-        dut.fill_entry_addr.value  = k
-        dut.fill_entry_value.value = values[k] & val_mask
-        dut.fill_entry_col.value   = col_idx[k]
+    col_mask = (1 << IDX_W) - 1
+    for base in range(0, len(values), FILL_W):
+        n = min(FILL_W, len(values) - base)
+        vals = cols = 0
+        for i in range(n):
+            vals |= (values[base + i] & val_mask) << (i * DATA_W)
+            cols |= (col_idx[base + i] & col_mask) << (i * IDX_W)
+        dut.fill_entry_we.value    = (1 << n) - 1
+        dut.fill_entry_addr.value  = base
+        dut.fill_entry_value.value = vals
+        dut.fill_entry_col.value   = cols
         await RisingEdge(dut.clk)
     dut.fill_entry_we.value = 0
     await RisingEdge(dut.clk)
@@ -284,6 +334,45 @@ async def run_stage2(dut, timeout=400000, perf=None):
     return cycles
 
 
+async def kick_stage2(dut, timeout=400000):
+    """Pulse s2_start and wait ONLY for s2_done (= router drained FIFO-A).
+    With S2_BEATS > 1 the PEs are still consuming FIFO-B backlog when this
+    returns -- FIFO-A is free for the next channel's fill+scan. Returns the
+    router window in cycles."""
+    await RisingEdge(dut.clk)
+    dut.s2_start.value = 1
+    await RisingEdge(dut.clk)
+    dut.s2_start.value = 0
+    cycles = 0
+    while cycles < timeout:
+        await ReadOnly()
+        if int(dut.s2_done.value) == 1:
+            break
+        await RisingEdge(dut.clk)
+        cycles += 1
+    await RisingEdge(dut.clk)
+    return cycles
+
+
+async def wait_pes_idle(dut, settle=4, timeout=400000):
+    """Wait until every FIFO-B has been empty (fifob_valid == 0) for `settle`
+    consecutive cycles -- i.e. the PEs have consumed the routed backlog. Safe
+    point to reload weights or start a drain. Returns cycles waited."""
+    idle = 0
+    cycles = 0
+    while cycles < timeout:
+        await ReadOnly()
+        if int(dut.fifob_valid.value) == 0:
+            idle += 1
+        else:
+            idle = 0
+        await RisingEdge(dut.clk)
+        cycles += 1
+        if idle >= settle:
+            break
+    return cycles
+
+
 def _tile_block(matrix, r0, c0, th, tw):
     """Local (th_actual x H) dense block covering input tile [r0,r0+th) x
     [c0,c0+tw). Global column index is preserved so idgen sees global coords.
@@ -344,13 +433,17 @@ async def drain_all(dut, timeout=50000, perf=None):
     while guard < timeout:
         await ReadOnly()
         ov = int(dut.out_valid.value)
+        lv = int(dut.out_lane_valid.value)
         oc = int(dut.out_cid.value)
         oa = int(dut.out_acc.value)
         for pe in range(N_PE):
             if (ov >> pe) & 1:
-                cid = (oc >> (pe * CID_W)) & cid_mask
-                acc = _signed((oa >> (pe * ACC_W)) & acc_mask, ACC_W)
-                got[pe][cid] = acc
+                for d in range(DRAIN_W):
+                    if (lv >> (pe * DRAIN_W + d)) & 1:
+                        sh = pe * DRAIN_W + d
+                        cid = (oc >> (sh * CID_W)) & cid_mask
+                        acc = _signed((oa >> (sh * ACC_W)) & acc_mask, ACC_W)
+                        got[pe][cid] = acc
         if int(dut.drain_done.value) == 1:
             seen_done = True
         await RisingEdge(dut.clk)

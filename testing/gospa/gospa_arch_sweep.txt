@@ -1,0 +1,16 @@
+GOSPA ARCH SWEEP -- MobileNetV2 3-layer real-tensor proxy (conv1 + pw 960->160 + pw 320->1280)
+f_clk=100 MHz; S2_BEATS=64/N_MULTS; dw excluded (mosaic mapping fixed at 8 PEs -- see report)
+
+   PExM  mults  proxyCyc  lat_ms  util%  GMAC/s  speedup
+--------------------------------------------------------
+    4x4     16    542502   5.425   60.0    0.96    0.50x
+    8x4     32    271591   2.716   60.0    1.92    1.00x
+   16x4     64    135821   1.358   60.0    3.84    2.00x
+   32x4    128     67910   0.679   60.0    7.67    4.00x
+    8x8     64    218498   2.185   37.3    2.39    1.24x
+   16x8    128    109251   1.093   37.3    4.77    2.49x
+
+winner: PE32xM4 -- FIFO-B depth sensitivity:
+  FIFOB_D=  256:     69046 cyc  util  59.0%
+  FIFOB_D= 1024:     67910 cyc  util  60.0%
+  FIFOB_D= 4096:     67910 cyc  util  60.0%

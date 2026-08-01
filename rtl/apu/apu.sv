@@ -25,12 +25,19 @@ module apu #(
     parameter int N_NZ_MAX  = 1024, // max non-zeros stored in entry SRAM
     parameter int DATA_W    = 16,
     parameter int FIFO_D    = 64,
+    parameter int FIFOB_D   = FIFO_D, // FIFO-B depth (decoupling backlog)
     parameter int STAGE1_BATCH = 1, // activations scanned/enumerated per cycle
+    parameter int FILL_W    = 1,    // CSR entries / row-ptrs written per cycle
+    parameter int S2_BEATS  = 1,    // beats the router emits per cycle
+    parameter bit CH_PID    = 1'b0, // channel-as-PID mode (CID space = H)
+    parameter int DW_COLW   = 0,    // >0: depthwise-mosaic demux col width
 
+    localparam int RD_W      = NUM_MULTS * S2_BEATS,
     localparam int E         = (H - F)/S + 1,
     localparam int N_PID     = F*F,
+    localparam int N_CID     = CH_PID ? H : E*E,
     localparam int IDX_W     = (H     < 2) ? 1 : $clog2(H),
-    localparam int CID_W     = (E*E   < 2) ? 1 : $clog2(E*E),
+    localparam int CID_W     = (N_CID < 2) ? 1 : $clog2(N_CID),
     localparam int PID_W     = (N_PID < 2) ? 1 : $clog2(N_PID),
     localparam int FIFOA_W   = DATA_W + CID_W,
     localparam int CNT_W     = $clog2(FIFO_D) + 1,
@@ -42,16 +49,17 @@ module apu #(
     input  wire  logic                              clk,
     input  wire  logic                              rst_n,
 
-    // -- Entry SRAM fill (one {value, col} per cycle) ------------------------
-    input  wire  logic                              fill_entry_we,
+    // -- Entry SRAM fill (FILL_W {value, col} per cycle; contiguous prefix,
+    //    lane 0 at fill_entry_addr, base FILL_W-aligned) ----------------------
+    input  wire  logic [FILL_W-1:0]                 fill_entry_we,
     input  wire  logic [ENT_AW-1:0]                 fill_entry_addr,
-    input  wire  logic [DATA_W-1:0]                 fill_entry_value,
-    input  wire  logic [IDX_W-1:0]                  fill_entry_col,
+    input  wire  logic [FILL_W-1:0][DATA_W-1:0]     fill_entry_value,
+    input  wire  logic [FILL_W-1:0][IDX_W-1:0]      fill_entry_col,
 
-    // -- Row-pointer SRAM fill (one pointer per cycle) -----------------------
-    input  wire  logic                              fill_rptr_we,
+    // -- Row-pointer fill (FILL_W pointers per cycle, lane j -> addr + j) -----
+    input  wire  logic [FILL_W-1:0]                 fill_rptr_we,
     input  wire  logic [RPTR_AW-1:0]                fill_rptr_addr,
-    input  wire  logic [PTR_W-1:0]                  fill_rptr_data,
+    input  wire  logic [FILL_W-1:0][PTR_W-1:0]      fill_rptr_data,
 
     // -- Scan control --------------------------------------------------------
     input  wire  logic                              scan_start,
@@ -68,6 +76,13 @@ module apu #(
     // -- Per-PE WSP, driven straight from the PE array (pe.wsp exports) -------
     //    LSB-first by PID: wsp[k][p] = 1 means PE k has a weight at PID p.
     input  wire  logic [N_PE-1:0][N_PID-1:0]        wsp,
+
+    // -- Depthwise-mosaic demux config (only sampled when DW_COLW > 0) -------
+    input  wire  logic                              dw_en,
+    input  wire  logic [N_PE-1:0][CID_W-1:0]        band_r0,
+    input  wire  logic [N_PE-1:0][CID_W-1:0]        band_r1,
+    input  wire  logic [N_PE-1:0][CID_W-1:0]        band_c0,
+    input  wire  logic [N_PE-1:0][CID_W-1:0]        band_c1,
 
     // -- FIFO-B read ports (one M-wide beat per PE; consumed by the PE array) -
     output logic [N_PE-1:0]                              fifob_rd_valid,
@@ -89,7 +104,7 @@ module apu #(
 
     act_sram_scanner #(
         .H(H), .N_ROWS(N_ROWS), .N_NZ_MAX(N_NZ_MAX), .DATA_W(DATA_W),
-        .STAGE1_BATCH(STAGE1_BATCH)
+        .STAGE1_BATCH(STAGE1_BATCH), .FILL_W(FILL_W)
     ) u_scanner (
         .clk               (clk),
         .rst_n             (rst_n),
@@ -116,14 +131,15 @@ module apu #(
     // -------------------------------------------------------------------------
     // Stage 1 / FIFO-A bank
     // -------------------------------------------------------------------------
-    logic [N_PID-1:0][NUM_MULTS-1:0]              fa_rd_valid;
-    logic [N_PID-1:0][NUM_MULTS-1:0][FIFOA_W-1:0] fa_rd_data;
-    logic [N_PID-1:0][NUM_MULTS-1:0]              fa_rd_ready;
-    logic [N_PID-1:0][CNT_W-1:0]                  fa_count;
+    logic [N_PID-1:0][RD_W-1:0]              fa_rd_valid;
+    logic [N_PID-1:0][RD_W-1:0][FIFOA_W-1:0] fa_rd_data;
+    logic [N_PID-1:0][RD_W-1:0]              fa_rd_ready;
+    logic [N_PID-1:0][CNT_W-1:0]             fa_count;
 
     apu_stage1 #(
-        .H(H), .F(F), .S(S), .NUM_MULTS(NUM_MULTS), .DATA_W(DATA_W),
-        .FIFO_D(FIFO_D), .STAGE1_BATCH(STAGE1_BATCH)
+        .H(H), .F(F), .S(S), .NUM_MULTS(NUM_MULTS), .S2_BEATS(S2_BEATS),
+        .DATA_W(DATA_W), .FIFO_D(FIFO_D), .STAGE1_BATCH(STAGE1_BATCH),
+        .CH_PID(CH_PID)
     ) u_stage1 (
         .clk           (clk),
         .rst_n         (rst_n),
@@ -145,7 +161,9 @@ module apu #(
     // -------------------------------------------------------------------------
     apu_stage2 #(
         .H(H), .F(F), .S(S),
-        .N_PE(N_PE), .NUM_MULTS(NUM_MULTS), .DATA_W(DATA_W), .FIFO_D(FIFO_D)
+        .N_PE(N_PE), .NUM_MULTS(NUM_MULTS), .S2_BEATS(S2_BEATS),
+        .CH_PID(CH_PID), .DW_COLW(DW_COLW), .DATA_W(DATA_W), .FIFO_D(FIFO_D),
+        .FIFOB_D(FIFOB_D)
     ) u_stage2 (
         .clk                (clk),
         .rst_n              (rst_n),
@@ -153,6 +171,11 @@ module apu #(
         .busy               (s2_busy),
         .done               (s2_done),
         .wsp                (wsp),
+        .dw_en              (dw_en),
+        .band_r0            (band_r0),
+        .band_r1            (band_r1),
+        .band_c0            (band_c0),
+        .band_c1            (band_c1),
         .fifoa_rd_valid     (fa_rd_valid),
         .fifoa_rd_data      (fa_rd_data),
         .fifoa_rd_ready     (fa_rd_ready),

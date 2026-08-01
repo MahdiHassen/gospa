@@ -32,10 +32,16 @@ module apu_stage1 #(
     parameter int H            = 32,   // activation map size (H x H, square)
     parameter int F            = 3,    // weight kernel size (F x F)
     parameter int S            = 1,    // convolution stride
-    parameter int NUM_MULTS    = 4,    // FIFO-A read width (router pops/cycle)
+    parameter int NUM_MULTS    = 4,    // beat width (activations / beat)
+    parameter int S2_BEATS     = 1,    // beats the router pops per cycle
     parameter int DATA_W       = 16,   // activation value width in bits
     parameter int FIFO_D       = 64,   // FIFO-A depth (power of 2)
     parameter int STAGE1_BATCH = 1,    // activations consumed per cycle (>=1)
+    parameter bit CH_PID       = 1'b0, // channel-as-PID mode (1x1 convs): the
+                                       // scanned "row" IS the PID (input
+                                       // channel) and the "col" IS the CID
+                                       // (flattened pixel); idgen bypassed.
+                                       // Build with H = pixel count.
 
     // -- Derived widths (mirror idgen.sv so all ports line up) ----------------
     localparam int E        = (H - F)/S + 1,                  // output map size
@@ -43,12 +49,14 @@ module apu_stage1 #(
     localparam int NUM_UNIT = G*G,                            // G^2 IDGen lanes
     localparam int N_PID    = F*F,                            // # FIFO-A slots
     localparam int IDX_W    = (H   < 2) ? 1 : $clog2(H),      // coord width
-    localparam int CID_W    = (E*E < 2) ? 1 : $clog2(E*E),    // CID width
+    localparam int N_CID    = CH_PID ? H : E*E,               // CID space
+    localparam int CID_W    = (N_CID < 2) ? 1 : $clog2(N_CID), // CID width
     localparam int PID_W    = (F*F < 2) ? 1 : $clog2(F*F),    // PID width
     localparam int FIFOA_W  = DATA_W + CID_W,                 // FIFO-A payload
     localparam int CNT_W    = $clog2(FIFO_D) + 1,             // FIFO occupancy width
     localparam int W        = STAGE1_BATCH,
-    localparam int PW       = (NUM_MULTS > W) ? NUM_MULTS : W  // FIFO port width
+    localparam int RD_W     = NUM_MULTS * S2_BEATS,           // router pop width
+    localparam int PW       = (RD_W > W) ? RD_W : W           // FIFO port width
 )(
     input  wire  logic                              clk,
     input  wire  logic                              rst_n,
@@ -61,11 +69,11 @@ module apu_stage1 #(
     input  wire  logic [W-1:0][IDX_W-1:0]           in_y,
     output logic                                    in_ready,       // whole batch taken
 
-    // -- FIFO-A read ports (one per PID slot, NUM_MULTS-wide; to Stage 2) ------
-    output logic [N_PID-1:0][NUM_MULTS-1:0]              fifoa_rd_valid,
-    output logic [N_PID-1:0][NUM_MULTS-1:0][FIFOA_W-1:0] fifoa_rd_data,   // {a_xy, cid}
-    input  wire  logic [N_PID-1:0][NUM_MULTS-1:0]        fifoa_rd_ready,
-    output logic [N_PID-1:0][CNT_W-1:0]                  fifoa_count
+    // -- FIFO-A read ports (one per PID slot, RD_W-wide; to Stage 2) ----------
+    output logic [N_PID-1:0][RD_W-1:0]              fifoa_rd_valid,
+    output logic [N_PID-1:0][RD_W-1:0][FIFOA_W-1:0] fifoa_rd_data,   // {a_xy, cid}
+    input  wire  logic [N_PID-1:0][RD_W-1:0]        fifoa_rd_ready,
+    output logic [N_PID-1:0][CNT_W-1:0]             fifoa_count
 );
 
     // -------------------------------------------------------------------------
@@ -86,47 +94,73 @@ module apu_stage1 #(
     logic                                 commit;        // batch written this cycle
 
     // -------------------------------------------------------------------------
-    // W parallel front-end chains: position_encode -> idgen
+    // W parallel front-end chains: position_encode -> idgen, or the CH_PID
+    // bypass (pid = scanned row = channel, cid = scanned col = pixel; exactly
+    // one pair per activation on unit 0).
     // -------------------------------------------------------------------------
     genvar i;
     /* verilator lint_off PINCONNECTEMPTY */
     generate
-        for (i = 0; i < W; i++) begin : g_lane
-            logic              pe_valid;
-            logic [DATA_W-1:0] pe_value;
-            logic [IDX_W-1:0]  pe_Px, pe_Py, pe_Cx, pe_Cy;
+        if (CH_PID) begin : g_chpid
+            for (i = 0; i < W; i++) begin : g_lane
+                always_comb begin
+                    ig_valid[i]    = '0;
+                    ig_axy[i]      = '0;
+                    ig_cid[i]      = '0;
+                    ig_pid[i]      = '0;
+                    ig_valid[i][0] = in_valid && in_lane_valid[i];
+                    ig_axy[i][0]   = in_value[i];
+                    ig_cid[i][0]   = CID_W'(in_y[i]);
+                    ig_pid[i][0]   = PID_W'(in_x[i]);
+                end
+            end
+`ifndef SYNTHESIS
+            always_comb begin
+                for (int j = 0; j < W; j++)
+                    assert #0 (!(in_valid && in_lane_valid[j])
+                               || (int'(in_x[j]) < N_PID))
+                        else $error("apu_stage1 CH_PID: channel row %0d >= N_PID=%0d",
+                                    in_x[j], N_PID);
+            end
+`endif
+        end else begin : g_spatial
+            for (i = 0; i < W; i++) begin : g_lane
+                logic              pe_valid;
+                logic [DATA_W-1:0] pe_value;
+                logic [IDX_W-1:0]  pe_Px, pe_Py, pe_Cx, pe_Cy;
 
-            position_encode #(.H(H), .S(S), .DATA_W(DATA_W)) u_position_encode (
-                .in_valid (in_valid && in_lane_valid[i]),
-                .in_value (in_value[i]),
-                .x        (in_x[i]),
-                .y        (in_y[i]),
-                .in_ready (),
-                .out_valid(pe_valid),
-                .out_value(pe_value),
-                .Px       (pe_Px),
-                .Py       (pe_Py),
-                .Cx       (pe_Cx),
-                .Cy       (pe_Cy),
-                .out_ready(1'b1)
-            );
+                position_encode #(.H(H), .S(S), .DATA_W(DATA_W)) u_position_encode (
+                    .in_valid (in_valid && in_lane_valid[i]),
+                    .in_value (in_value[i]),
+                    .x        (in_x[i]),
+                    .y        (in_y[i]),
+                    .in_ready (),
+                    .out_valid(pe_valid),
+                    .out_value(pe_value),
+                    .Px       (pe_Px),
+                    .Py       (pe_Py),
+                    .Cx       (pe_Cx),
+                    .Cy       (pe_Cy),
+                    .out_ready(1'b1)
+                );
 
-            idgen #(
-                .H(H), .F(F), .S(S), .ACT_WIDTH(DATA_W), .PIPE(1'b0)
-            ) u_idgen (
-                .clk     (clk),
-                .rst_n   (rst_n),
-                .in_valid(pe_valid),
-                .a_xy_in (pe_value),
-                .Px      (pe_Px),
-                .Py      (pe_Py),
-                .Cx      (pe_Cx),
-                .Cy      (pe_Cy),
-                .valid   (ig_valid[i]),
-                .a_xy_out(ig_axy[i]),
-                .cid     (ig_cid[i]),
-                .pid     (ig_pid[i])
-            );
+                idgen #(
+                    .H(H), .F(F), .S(S), .ACT_WIDTH(DATA_W), .PIPE(1'b0)
+                ) u_idgen (
+                    .clk     (clk),
+                    .rst_n   (rst_n),
+                    .in_valid(pe_valid),
+                    .a_xy_in (pe_value),
+                    .Px      (pe_Px),
+                    .Py      (pe_Py),
+                    .Cx      (pe_Cx),
+                    .Cy      (pe_Cy),
+                    .valid   (ig_valid[i]),
+                    .a_xy_out(ig_axy[i]),
+                    .cid     (ig_cid[i]),
+                    .pid     (ig_pid[i])
+                );
+            end
         end
     endgenerate
     /* verilator lint_on PINCONNECTEMPTY */
@@ -182,9 +216,9 @@ module apu_stage1 #(
             always_comb begin
                 wr_valid_vec = commit ? wr_valid_pre[p] : '0;
                 wr_data_vec  = wr_data_pre[p];
-                // Router reads the low NUM_MULTS lanes; any surplus is idle.
+                // Router reads the low RD_W lanes; any surplus is idle.
                 rd_ready_vec = '0;
-                for (int m = 0; m < NUM_MULTS; m++) begin
+                for (int m = 0; m < RD_W; m++) begin
                     fifoa_rd_valid[p][m] = rd_valid_vec[m];
                     fifoa_rd_data[p][m]  = rd_data_vec[m];
                     rd_ready_vec[m]      = fifoa_rd_ready[p][m];
