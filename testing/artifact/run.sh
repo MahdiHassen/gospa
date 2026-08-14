@@ -14,7 +14,7 @@
 # ============================================================================
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(dirname "$HERE")"
+ROOT="$(cd "$HERE/../.." && pwd)"
 RES="$HERE/results"
 mkdir -p "$RES"
 

@@ -21,7 +21,7 @@ RTL it verifies. Changes made relative to that snapshot:
   the paper's RTL-measured V1-vs-V2 comparison. Build it with
   `FIFO_D=1024`: V1's serial scan-then-route flow deadlocks if a per-PID
   FIFO-A fills mid-scan, so FIFO-A must hold a whole channel at H=32.
-  Invoked by `artifact/run.sh v1v2`.
+  Invoked by `testing/artifact/run.sh v1v2`.
 
 All targets pass under Verilator 5.048 / cocotb 2.0:
 
