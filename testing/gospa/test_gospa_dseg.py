@@ -39,9 +39,13 @@ S1B = int(os.environ.get("STAGE1_BATCH", "4"))
 CSV = os.environ.get(
     "DSEG_CSV", os.path.join(_TEST_DIR, "gospa_dseg_rows.csv"))
 # DENS="0.1,0.3,1.0" runs a subset of the diagonal (selective checks).
+# DA_FIX / DW_FIX pin one density: the GRID then varies only the other
+# (asymmetric-sparsity sweeps). DSEG_TAG overrides the config tag in rows.
 GRID = ([float(s) for s in os.environ["DENS"].split(",")]
         if os.environ.get("DENS") else
         [round(0.1 * i, 1) for i in range(1, 11)])
+DA_FIX = os.environ.get("DA_FIX")
+DW_FIX = os.environ.get("DW_FIX")
 N_CHAN = 3
 N_OUT = 32
 
@@ -99,7 +103,7 @@ async def test_density_segments(dut):
     cocotb.start_soon(_fifob_monitor(dut, mon, stop))
     rng = random.Random(0xD5EE9)
     lanes = tb.N_PE * tb.N_MULTS
-    tag = f"S{tb.S2_BEATS}B{S1B}"
+    tag = os.environ.get("DSEG_TAG", f"S{tb.S2_BEATS}B{S1B}")
 
     hdr = (f"{'dens':>5} {'totCyc':>7} {'walk%':>6} {'fs%':>5} {'idle%':>6} "
            f"{'swap%':>6} {'pre%':>5} {'drn%':>5} {'wBusy%':>7} {'e2eU%':>6}")
@@ -115,8 +119,10 @@ async def test_density_segments(dut):
     ]
     with open(CSV, "a") as fh:
         for d in GRID:
-            kers = [rand_kernels(rng, N_OUT, d) for _ in range(N_CHAN)]
-            acts = [make_activation(rng, d, pad=0) for _ in range(N_CHAN)]
+            da = float(DA_FIX) if DA_FIX else d
+            dw = float(DW_FIX) if DW_FIX else d
+            kers = [rand_kernels(rng, N_OUT, dw) for _ in range(N_CHAN)]
+            acts = [make_activation(rng, da, pad=0) for _ in range(N_CHAN)]
             golden = []
             for k in range(N_OUT):
                 acc = [[0] * tb.E for _ in range(tb.E)]

@@ -101,6 +101,7 @@ def _rand_matrix(rng, density):
 async def reset(dut):
     dut.rst_n.value          = 0
     dut.in_valid.value       = 0
+    dut.in_lane_valid.value  = 0
     dut.in_value.value       = 0
     dut.in_x.value           = 0
     dut.in_y.value           = 0
@@ -114,6 +115,7 @@ async def reset(dut):
 async def _send_tuple(dut, value, x, y):
     """Present one (val, x, y) tuple to apu_stage1 and wait for in_ready."""
     dut.in_valid.value = 1
+    dut.in_lane_valid.value = 1
     dut.in_value.value = value & ((1 << DATA_W) - 1)
     dut.in_x.value     = x
     dut.in_y.value     = y
@@ -198,14 +200,14 @@ async def run_case(dut, matrix, name):
 @cocotb.test()
 async def test_empty(dut):
     """All-zero activation map -> every FIFO-A empty."""
-    cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk, CLK_NS, unit="ns").start())
     await run_case(dut, [[0] * H for _ in range(H)], "empty")
 
 
 @cocotb.test()
 async def test_single_nonzero(dut):
     """One non-zero near the centre."""
-    cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk, CLK_NS, unit="ns").start())
     m = [[0] * H for _ in range(H)]
     m[H // 2][H // 2] = 7
     await run_case(dut, m, "single_nonzero")
@@ -214,7 +216,7 @@ async def test_single_nonzero(dut):
 @cocotb.test()
 async def test_dense(dut):
     """Fully dense map (stresses FIFO-A occupancy and the join logic)."""
-    cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk, CLK_NS, unit="ns").start())
     m = [[((r * H + c) % 50) - 25 or 1 for c in range(H)] for r in range(H)]
     await run_case(dut, m, "dense")
 
@@ -222,7 +224,7 @@ async def test_dense(dut):
 @cocotb.test()
 async def test_random(dut):
     """Several randomized sparse maps (with negative values)."""
-    cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk, CLK_NS, unit="ns").start())
     rng = random.Random(0xA9)
     for i in range(6):
         density = [0.1, 0.25, 0.4, 0.5, 0.75, 0.9][i]
@@ -232,7 +234,7 @@ async def test_random(dut):
 @cocotb.test()
 async def test_paper_toy(dut):
     """The reference-doc toy example (only meaningful at F=2,H=3,S=1)."""
-    cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk, CLK_NS, unit="ns").start())
     if (H, F, S) != (3, 2, 1):
         dut._log.info(f"[paper_toy] skipped (config H={H} F={F} S={S} != 3,2,1)")
         return

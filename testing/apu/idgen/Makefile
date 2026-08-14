@@ -22,7 +22,7 @@ TOPLEVEL = idgen
 MODULE   = tb_idgen
 
 # Path to the RTL, relative to this Makefile's location.
-RTL_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))../../rtl/apu/stage1
+RTL_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))../../../rtl/V2/apu/stage1
 VERILOG_SOURCES = $(RTL_DIR)/idgen.sv
 
 # Pass H/F/S into the RTL as parameter overrides.

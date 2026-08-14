@@ -13,7 +13,7 @@ SIM      ?= icarus
 TOPLEVEL_LANG ?= verilog
 
 REPO_ROOT := $(realpath ../..)
-ARITH     := $(REPO_ROOT)/rtl/common/arith
+ARITH     := $(REPO_ROOT)/rtl/V2/common/arith
 
 A_W ?= 16
 B_W ?= 16

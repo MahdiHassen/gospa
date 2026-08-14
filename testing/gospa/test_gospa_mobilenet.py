@@ -146,7 +146,11 @@ async def _run_layer(dut, mon, idx):
                 out = [got[p].get(px, 0) for px in range(n_px)]
                 if out != golden:
                     mismatches += 1
-                    dut._log.error(f"L{idx} out-ch {k} mismatch (CH_PID)")
+                    diffs = [(px, golden[px], out[px])
+                             for px in range(n_px) if golden[px] != out[px]]
+                    dut._log.error(
+                        f"L{idx} out-ch {k} mismatch (CH_PID): "
+                        f"{len(diffs)}/{n_px} px wrong, first 4: {diffs[:4]}")
     elif depthwise and tb.DW_COLW > 0:
         # ---- depthwise mosaic: 8 channels tiled 3x3 into one composite -----
         # map (zero gaps between tiles), one traditional-conv pass; the

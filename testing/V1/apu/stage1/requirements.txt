@@ -1,0 +1,2 @@
+cocotb>=1.9.0
+cocotb-bus>=0.2.1

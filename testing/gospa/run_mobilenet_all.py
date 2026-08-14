@@ -23,8 +23,8 @@ import mobilenet_layers                                   # noqa: E402
 
 N_PE = int(os.environ.get("N_PE", "8"))
 N_MULTS = int(os.environ.get("N_MULTS", "4"))
-ROWS = os.path.join(_HERE, "gospa_mobilenet_rows.csv")
-OUT = os.path.join(_HERE, "gospa_mobilenet_network.txt")
+ROWS = os.environ.get("MN_ROWS", os.path.join(_HERE, "gospa_mobilenet_rows.csv"))
+OUT = os.environ.get("MN_OUT", os.path.join(_HERE, "gospa_mobilenet_network.txt"))
 
 
 def next_pow2(n):

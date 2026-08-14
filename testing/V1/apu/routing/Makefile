@@ -23,11 +23,11 @@ TOPLEVEL = routing
 MODULE   = tb_routing
 
 # Path to the RTL, relative to this Makefile's location.
-RTL_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))../../rtl/apu/stage2
+RTL_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))../../../../rtl/V1/apu/stage2
 VERILOG_SOURCES = $(RTL_DIR)/routing.sv
 
 # Put the functional model (sw/functional.py) on PYTHONPATH so the testbench can import it
-SW_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))../../sw
+SW_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))../../sw_v1
 export PYTHONPATH := $(SW_DIR):$(PYTHONPATH)
 
 # Pass shape into the RTL as parameter overrides.

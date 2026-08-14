@@ -16,7 +16,7 @@ MODULE        ?= test_gospa
 TOPLEVEL      := gospa
 
 REPO_ROOT := $(realpath ../..)
-RTL_DIR   := $(REPO_ROOT)/rtl
+RTL_DIR   := $(REPO_ROOT)/rtl/V2
 
 VERILOG_SOURCES := $(RTL_DIR)/common/fifo.sv \
                    $(RTL_DIR)/common/sram.sv \

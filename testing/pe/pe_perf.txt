@@ -1,0 +1,37 @@
+PE PERF  H=8 F=3 S=1 NUM_MULTS=4  f_clk=500 MHz (simulated)  dense=82 cyc  peak=4.000 GOPS/s
+case           minCyc computeCyc  latency  speedup   GOPS/s  multUtil%
+----------------------------------------------------------------------
+roofline           81         82      135     1.00    3.951       98.8
+act90_wgt90        68         69      121     1.19    3.739       93.5
+act80_wgt80        21         22       69     3.73    3.727       93.2
+act70_wgt70        28         29       78     2.83    3.690       92.2
+act60_wgt60        33         34       85     2.41    3.559       89.0
+act50_wgt50d       27         28       78     2.93    3.464       86.6
+act40_wgt40         8          9       56     9.11    3.333       83.3
+act30_wgt30d        8          9       55     9.11    2.889       72.2
+act20_wgt20         4          5       51    16.40    2.600       65.0
+act10_wgt10         2          3       48    27.33    2.000       50.0
+
+act100_wgt70       72         73      125     1.12    3.945       98.6
+act100_wgt50       27         28       75     2.93    3.857       96.4
+act100_wgt30       18         19       65     4.32    3.789       94.7
+act100_wgt10       18         19       65     4.32    3.789       94.7
+act80_wgt100       66         67      120     1.22    3.716       92.9
+act60_wgt100       58         59      112     1.39    3.661       91.5
+act30_wgt100       24         25       78     3.28    3.280       82.0
+act10_wgt100       12         13       66     6.31    2.615       65.4
+act80_wgt70        28         29       77     2.83    3.586       89.7
+act60_wgt50        30         31       80     2.65    3.613       90.3
+act50_wgt50        16         17       65     4.82    3.706       92.6
+act30_wgt70        14         15       64     5.47    3.400       85.0
+act30_wgt30         9         10       58     8.20    2.600       65.0
+act10_wgt50         3          4       51    20.50    2.250       56.2
+act10_wgt20         0          0       39     0.00    0.000        0.0
+----------------------------------------------------------------------
+legend:
+  minCyc     = beats admitted (1 M-wide same-PID beat/cycle, no stalls)
+  computeCyc = actual streaming cycles -> minCyc + reload (SKIP) stalls
+  latency    = end-to-end: computeCyc + weight-load + warm-up + drain
+  speedup    = roofline computeCyc / computeCyc of this case
+  GOPS/s     = rate over computeCyc, 1 MAC = 2 ops
+  multUtil%  = MACs / (computeCyc x NUM_MULTS); set by PID run-length

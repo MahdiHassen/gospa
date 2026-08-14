@@ -19,7 +19,7 @@ TOPLEVEL_LANG ?= verilog
 
 # -- Paths --------------------------------------------------------------------
 REPO_ROOT   := $(realpath ../../..)
-RTL_DIR     := $(REPO_ROOT)/rtl/apu/stage1
+RTL_DIR     := $(REPO_ROOT)/rtl/V2/apu/stage1
 
 # -- Per-module config (set by MODULE=... on command line) --------------------
 ifeq ($(MODULE),test_csr_decode)
@@ -38,7 +38,7 @@ endif
 ifeq ($(MODULE),test_apu_stage1)
     # apu_stage1 now takes (val, x, y) directly (csr_decode lives upstream of
     # the APU as part of the activation SRAM scanner in act_sram_scanner.sv).
-    VERILOG_SOURCES := $(REPO_ROOT)/rtl/common/fifo.sv \
+    VERILOG_SOURCES := $(REPO_ROOT)/rtl/V2/common/fifo.sv \
                        $(RTL_DIR)/zero_act.sv \
                        $(RTL_DIR)/position_encode.sv \
                        $(RTL_DIR)/idgen.sv \
@@ -54,7 +54,7 @@ ifeq ($(MODULE),test_apu_stage1)
         COMPILE_ARGS += -g2012 -Papu_stage1.H=$(H) -Papu_stage1.F=$(F) -Papu_stage1.S=$(S)
     endif
     ifeq ($(SIM),verilator)
-        COMPILE_ARGS += -GH=$(H) -GF=$(F) -GS=$(S)
+        COMPILE_ARGS += -GH=$(H) -GF=$(F) -GS=$(S) -GNUM_MULTS=1 -GS2_BEATS=1
     endif
 
     export H

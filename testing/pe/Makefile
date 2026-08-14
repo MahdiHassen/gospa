@@ -35,7 +35,7 @@ WAVES     ?= 0
 
 
 REPO_ROOT := $(realpath ../..)
-RTL       := $(REPO_ROOT)/rtl
+RTL       := $(REPO_ROOT)/rtl/V2
 
 E     := $(shell echo $$(( ($(H) - $(F)) / $(S) + 1 )))
 NUM_PID := $(shell echo $$(( $(F) * $(F) )))

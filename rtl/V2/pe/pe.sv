@@ -281,7 +281,11 @@ module pe #(
                          && (mac_busy == '0) && !consume;
 
     assign wsp_valid   = armed;
-    assign drain_busy  = draining;
+    // drain_req_q counts as busy: a PE whose drain is pending on its MAC
+    // pipeline flush must hold the array-level OR high, or a short (wide
+    // DRAIN_W) drain on a faster PE can drop it to zero and pulse drain_done
+    // before the delayed PE has even started (its beats would be lost).
+    assign drain_busy  = draining || drain_req_q;
     assign drain_done  = busy_q && !drain_busy;
     assign out_valid   = draining;
     assign out_cid     = drain_idx;

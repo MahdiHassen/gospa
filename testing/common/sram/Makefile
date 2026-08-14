@@ -24,7 +24,7 @@ TOPLEVEL = sram
 MODULE   = tb_sram
 
 # Path to the RTL, relative to this Makefile's location.
-RTL_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))../../rtl/common
+RTL_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))../../../rtl/V2/common
 VERILOG_SOURCES = $(RTL_DIR)/sram.sv
 
 ifeq ($(SIM),icarus)

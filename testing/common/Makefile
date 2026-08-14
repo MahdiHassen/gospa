@@ -21,7 +21,7 @@ SIM ?= verilator
 
 # ---- Paths -------------------------------------------------------------------
 REPO_ROOT := $(realpath ../..)
-RTL_DIR   := $(REPO_ROOT)/rtl/common
+RTL_DIR   := $(REPO_ROOT)/rtl/V2/common
 TB_DIR    := $(CURDIR)
 
 # ---- Source files ------------------------------------------------------------

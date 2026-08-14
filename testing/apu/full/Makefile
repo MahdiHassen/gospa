@@ -19,7 +19,7 @@ TOPLEVEL      := apu
 
 # -- Paths --------------------------------------------------------------------
 REPO_ROOT := $(realpath ../../..)
-RTL_DIR   := $(REPO_ROOT)/rtl
+RTL_DIR   := $(REPO_ROOT)/rtl/V2
 
 VERILOG_SOURCES := $(RTL_DIR)/common/fifo.sv \
                    $(RTL_DIR)/common/sram.sv \
@@ -28,7 +28,7 @@ VERILOG_SOURCES := $(RTL_DIR)/common/fifo.sv \
                    $(RTL_DIR)/apu/stage1/apu_stage1.sv \
                    $(RTL_DIR)/apu/stage2/routing.sv \
                    $(RTL_DIR)/apu/stage2/apu_stage2.sv \
-                   $(RTL_DIR)/apu/act_sram_scanner.sv \
+                   $(RTL_DIR)/apu/stage1/act_sram_scanner.sv \
                    $(RTL_DIR)/apu/apu.sv
 
 # -- Functional-model import: the TB does `import functional` from sw/ -------

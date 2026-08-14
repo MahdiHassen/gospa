@@ -18,3 +18,17 @@ __pycache__/
 
 #VSCode
 .vscode/
+
+# Report LaTeX working dir (kept out of the repo)
+omiited-report/
+
+# macOS
+.DS_Store
+
+# Artifact scratch (logs / tmp merges; reference results ARE committed)
+artifact/results/_*
+
+# Local sweep scratch
+testing/gospa/_dseg_tmp.csv
+testing/gospa/alexnet_L*_run.log
+testing/V1/gospa/v1_perf_rows.csv

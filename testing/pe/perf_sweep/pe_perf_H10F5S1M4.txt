@@ -1,0 +1,43 @@
+PE PERF  H=10 F=5 S=1 NUM_MULTS=4 NSEEDS=5  f_clk=500 MHz (simulated)  dense=901 cyc  peak=4.000 GOPS/s
+case          minCyc  cmpCyc  latency  speedup  GOPS/s  multUtil%  idle%  stall%  macs/act  inBits/mac
+------------------------------------------------------------------------------------------------------
+roofline         900     901     1040     1.00   3.996       99.9    0.0     0.1      4.00         7.3
+act90_wgt90      759     760      882     1.19   3.324       83.1   16.8     0.1      3.33         8.8
+act80_wgt80      711     713      825     1.26   2.893       72.3   27.4     0.3      2.90        10.0
+act70_wgt70      599     600      707     1.50   2.733       68.3   31.4     0.3      2.74        10.7
+act60_wgt60      502     505      601     1.78   2.299       57.5   42.1     0.5      2.31        12.7
+act50_wgt50d     361     363      448     2.48   2.042       51.0   48.3     0.7      2.06        14.4
+act40_wgt40      318     321      398     2.81   1.818       45.5   53.7     0.9      1.83        16.1
+act30_wgt30d     164     167      233     5.38   1.513       37.8   60.0     2.1      1.55        19.7
+act20_wgt20      103     106      167     8.44   1.303       32.6   64.2     3.2      1.35        23.3
+act10_wgt10       30      34       83    25.89   1.040       26.0   62.5    11.5      1.18        28.3
+
+act100_wgt70     864     865      969     1.04   2.695       67.4   32.4     0.2      2.70        10.6
+act100_wgt50     828     830      915     1.09   1.994       49.9   49.9     0.3      2.00        14.1
+act100_wgt30     604     608      672     1.48   1.492       37.3   62.2     0.5      1.50        18.6
+act100_wgt10     280     284      333     3.17   1.266       31.6   67.1     1.3      1.28        21.6
+act80_wgt100     680     681      820     1.32   3.994       99.9    0.0     0.1      4.00         7.5
+act60_wgt100     508     509      648     1.77   3.992       99.8    0.0     0.2      4.00         7.8
+act30_wgt100     272     273      412     3.30   3.985       99.6    0.0     0.4      4.00         8.7
+act10_wgt100     119     120      259     7.50   3.967       99.2    0.0     0.8      4.00        11.2
+act80_wgt70      691     693      802     1.30   2.826       70.6   29.1     0.3      2.83        10.3
+act60_wgt50      445     448      532     2.01   1.957       48.9   50.5     0.5      1.97        14.8
+act50_wgt50      361     363      448     2.48   2.042       51.0   48.3     0.7      2.06        14.4
+act30_wgt70      260     262      369     3.43   2.751       68.8   30.4     0.8      2.77        11.7
+act30_wgt30      164     167      233     5.38   1.513       37.8   60.0     2.1      1.55        19.7
+act10_wgt50       41      49      133    18.31   1.724       43.1   40.2    16.7      2.07        24.2
+act10_wgt20       42      47      109    19.17   1.247       31.2   58.2    10.6      1.40        27.7
+------------------------------------------------------------------------------------------------------
+legend (cycle columns are per-seed means; ratios pooled over seeds):
+  minCyc     = admitted FIFO-B entries; 1 activation/cycle with no stalls
+  cmpCyc     = streaming cycles = minCyc + fetch-stall beats
+  latency    = end-to-end: cmpCyc + weight-load + arm + drain
+  speedup    = roofline cmpCyc / this case's cmpCyc
+  GOPS/s     = rate over streaming cycles, 1 MAC = 2 ops
+  multUtil%  = MACs / (cmpCyc x NUM_MULTS)   <- the headline metric
+  idle%      = lane-slots lost to WSP misses on admitted beats
+               (union-gated stream: lanes whose kernel lacks this PID)
+  stall%     = lane-slots lost to whole-PE fetch-stall beats (SKIP)
+               multUtil + idle + stall = 100 by construction
+  macs/act   = useful MACs per admitted activation (broadcast efficiency)
+  inBits/mac = input-side transfer (FIFO-B entries + weight fills) per MAC
