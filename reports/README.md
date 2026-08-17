@@ -45,7 +45,7 @@ sw/                 Software models
   perf_model.py, perf_pe.py, sim.py, layer.py, config.py    cycle-accounting model
   workloads/          AlexNet, MobileNetV2 layer descriptors
 
-reports/            plan.md, progress_*.md, final_report/, this README
+reports/            plan.md, progress_*.md, analysis notes, this README
 ```
 
 ### V1 vs V2
@@ -75,7 +75,7 @@ the source of the reported results.
 | Verilator | 5.042 | primary RTL simulator |
 | Icarus Verilog | 12.0 | alternative simulator (default in a few dirs) |
 | Python | 3.12 | models, cocotb tests, plotting |
-| cocotb | 1.9.2 | RTL ↔ Python co-simulation |
+| cocotb | 1.9.2 | RTL <=> Python co-simulation |
 | numpy, torch, matplotlib | — | reference tensors, quantization, plots |
 
 **Activate the Python environment before running anything** — cocotb, numpy, torch and
