@@ -447,19 +447,23 @@ module pe #(
     logic [N_MULTS-1:0][ACC_W-1:0]   pe_out_acc_w;
     logic [N_MULTS-1:0]              pe_drain_busy_w;
 
-    // Per-lane stage-2 accumulate-enable (registered product valid). Held at
-    // module scope so the drain can wait for the MAC pipeline to flush.
+    // Per-lane stage-2 accumulate-enable (pipelined product valid) and in-flight
+    // status. Held at module scope so the drain can wait for the MAC pipeline to
+    // flush. mac_busy[k] is high while ANY product is in lane k's multiplier
+    // pipeline, which is what the deep pipeline needs (a lane can hold several
+    // products in flight while mac_en_q is momentarily low).
     logic [N_MULTS-1:0]              mac_en_q;
+    logic [N_MULTS-1:0]              mac_busy;
 
-    // Defer the accumulator drain until every lane's in-flight product has been
-    // accumulated (mac_en_q all 0) and no new product is being formed this
-    // cycle (!consume). Otherwise the trailing pipelined product would be
-    // dropped when pe_acc switches into drain-readout mode. drain_start is
-    // latched so a single-cycle pulse is not lost while we wait for the flush.
+    // Defer the accumulator drain until every lane's multiplier pipeline has
+    // fully flushed (mac_busy all 0) and no new product is being formed this
+    // cycle (!consume). Otherwise a trailing in-flight product would be dropped
+    // when pe_acc switches into drain-readout mode. drain_start is latched so a
+    // single-cycle pulse is not lost while we wait for the flush.
     logic                            drain_req_q;
     logic                            acc_drain_pulse;
     assign acc_drain_pulse = (drain_start || drain_req_q)
-                          && (mac_en_q == '0) && !consume;
+                          && (mac_busy == '0) && !consume;
 
     always_ff @(posedge clk) begin
         if      (!rst_n)            drain_req_q <= 1'b0;
@@ -471,26 +475,40 @@ module pe #(
     /* verilator lint_off PINCONNECTEMPTY */
     generate
         for (k = 0; k < N_MULTS; k++) begin : g_lane
-            // ----- Stage 1: multiply (combinational) -> product register -----
-            logic signed [PROD_W-1:0] prod_k;     // combinational product
-            logic signed [PROD_W-1:0] prod_q;     // registered product (DSP out reg)
-            logic        [CID_W-1:0]  cid_q;       // CID aligned to prod_q
+            // ----- Stage 1: custom deeply-pipelined structural multiplier -----
+            // Replaces the bare `b_act * mac_w[k]`, which inferred a hard DSP
+            // block. mult_pipe (rtl/V1/common/arith) builds the product from
+            // explicit signed partial products reduced by a registered
+            // ripple-carry adder tree, so the multiply leaves the critical path
+            // and the design is DSP-free and ASIC-portable. V2 instantiates the
+            // same unit, so a V1-vs-V2 comparison isolates the dataflow rather
+            // than the multiplier implementation.
+            //
+            // The CID rides the multiplier's aux passthrough, delayed by exactly
+            // the pipeline latency, so it emerges aligned with its product and
+            // needs no manual latency matching here.
+            logic signed [PROD_W-1:0] prod_q;     // pipelined product
+            logic        [CID_W-1:0]  cid_q;      // CID aligned to prod_q
+            logic                     lane_go;
 
-            assign prod_k = b_act * $signed(mac_w[k]);
+            assign lane_go = consume && mac_en[k] && !drain_busy;
 
-            always_ff @(posedge clk) begin
-                if (!rst_n) begin
-                    prod_q      <= '0;
-                    cid_q       <= '0;
-                    mac_en_q[k] <= 1'b0;
-                end else begin
-                    prod_q      <= prod_k;
-                    cid_q       <= b_cid;
-                    mac_en_q[k] <= consume && mac_en[k] && !drain_busy;
-                end
-            end
+            mult_pipe #(
+                .A_W(DATA_W), .B_W(DATA_W), .AUX_W(CID_W)
+            ) u_mult (
+                .clk      (clk),
+                .rst_n    (rst_n),
+                .in_valid (lane_go),
+                .a        (b_act),
+                .b        ($signed(mac_w[k])),
+                .aux_in   (b_cid),
+                .out_valid(mac_en_q[k]),
+                .p        (prod_q),
+                .aux_out  (cid_q),
+                .busy     (mac_busy[k])
+            );
 
-            // ----- Stage 2: accumulate the registered product -----
+            // ----- Stage 2: accumulate the pipelined product -----
             pe_acc #(
                 .N_CID(N_CID), .ACC_WIDTH(ACC_W), .PROD_WIDTH(PROD_W)
             ) u_acc (

@@ -33,7 +33,9 @@ MODULE ?= test_pe
 
 # Single PE vs PE array: pick top module + sources from MODULE.
 ifeq ($(MODULE),test_pe_array)
-    VERILOG_SOURCES := $(REPO_ROOT)/rtl/V1/common/sram.sv \
+    VERILOG_SOURCES := $(REPO_ROOT)/rtl/V1/common/arith/rca_add.sv \
+                       $(REPO_ROOT)/rtl/V1/common/arith/mult_pipe.sv \
+                       $(REPO_ROOT)/rtl/V1/common/sram.sv \
                        $(PE_DIR)/pe_acc.sv $(PE_DIR)/pe.sv $(PE_DIR)/pe_array.sv
     TOPLEVEL        := pe_array
     PARAMS_ICARUS   := -Ppe_array.N_PID=$(N_PID) -Ppe_array.N_CID=$(N_CID) \
@@ -41,7 +43,9 @@ ifeq ($(MODULE),test_pe_array)
     PARAMS_VERILATOR:= -GN_PID=$(N_PID) -GN_CID=$(N_CID) \
                        -GN_PE=$(N_PE) -GN_MULTS=$(N_MULTS)
 else
-    VERILOG_SOURCES := $(REPO_ROOT)/rtl/V1/common/sram.sv \
+    VERILOG_SOURCES := $(REPO_ROOT)/rtl/V1/common/arith/rca_add.sv \
+                       $(REPO_ROOT)/rtl/V1/common/arith/mult_pipe.sv \
+                       $(REPO_ROOT)/rtl/V1/common/sram.sv \
                        $(PE_DIR)/pe_acc.sv $(PE_DIR)/pe.sv
     TOPLEVEL        := pe
     PARAMS_ICARUS   := -Ppe.N_PID=$(N_PID) -Ppe.N_CID=$(N_CID) -Ppe.N_MULTS=$(N_MULTS)
