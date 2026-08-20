@@ -48,6 +48,28 @@ sw/                 Software models
 reports/            plan.md, progress_*.md, analysis notes, this README
 ```
 
+### V3
+
+Current development lives on the **`V3_Final`** branch. It drops the side-by-side
+`rtl/V1` / `rtl/V2` split above in favor of a single flat RTL tree — `rtl/apu`,
+`rtl/pe`, `rtl/common`, `rtl/gospa.sv`, `rtl/controller.sv` — with a matching `testing/gospa` testbench tree.
+
+The artifact runner is `testing/artifact/run.sh`, documented in
+`testing/artifact/README.md`:
+
+```bash
+cd testing/artifact
+bash run.sh alexnet      # 5-layer AlexNet,   N_PE=8  x N_MULTS=4 = 32 mult
+bash run.sh mobilenet    # 52-layer MobileNetV2, N_PE=16 x N_MULTS=4 = 64 mult
+```
+
+Each run golden-checks against the functional model and copies its report to
+`testing/artifact/results/`, timestamped, for comparison against the checked-in
+reference files in `testing/gospa/`.
+
+---
+
+
 ### V1 vs V2
 
 Both instantiate **32 multipliers** (`N_PE × N_MULTS`), but arrange them differently:
@@ -67,7 +89,7 @@ the source of the reported results.
 
 ---
 
-## Development environment
+## Development environment (Applies to V3 as well)
 
 | Tool | Version used | Purpose |
 |---|---|---|
