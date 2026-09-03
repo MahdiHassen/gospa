@@ -31,4 +31,16 @@ testing/artifact/results/_*
 # Local sweep scratch
 testing/gospa/_dseg_tmp.csv
 testing/gospa/alexnet_L*_run.log
-testing/V1/gospa/v1_perf_rows.csv
+
+# Local sweep/scratch outputs (reference results live in testing/artifact/results/)
+testing/gospa/gospa_*_perf*.txt
+testing/gospa/gospa_dseg_*
+testing/gospa/gospa_dsweep_*
+testing/gospa/gospa_alximbal_rows.csv
+testing/gospa/gospa_graphdata.txt
+testing/gospa/gospa_mobilenet_L*_perf.txt
+testing/gospa/gospa_mobilenet_rows.csv
+testing/gospa/gospa_tiled_perf_*
+testing/gospa/metrics_*_rows.csv
+testing/gospa/v1_baseline/
+testing/V1/

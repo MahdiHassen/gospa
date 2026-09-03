@@ -1,8 +1,9 @@
 # goSPA Accelerator — Top-Level Interface and Operating Guide
 
-> **⚠️ STALE — describes the V1 (lane-per-kernel) build.** The RTL on main has
-> since moved to the V2 "one kernel per PE" dataflow (commit `18e3633` and
-> later). Key differences from what this document describes:
+> **⚠️ Partially stale — parts of this document describe an earlier
+> lane-per-kernel revision of the design.** The RTL has since moved to the
+> "one kernel per PE" dataflow (commit `18e3633` and later). Key differences
+> from what this document describes:
 >
 > - **One kernel per PE**: output channels per pass = `N_PE`, not
 >   `N_PE × N_MULTS`. The `N_MULTS` lanes consume up to M FIFO-B activations
@@ -20,7 +21,8 @@
 > The port lists and parameter meanings in `gospa.sv`, `pe/pe.sv`, and
 > `apu/apu.sv` headers are the source of truth; `testing/gospa/gospa_tb.py`
 > shows the current host sequence. The storage/backpressure discussion below
-> is still broadly correct in spirit but the numbers refer to the V1 build.
+> is still broadly correct in spirit but the numbers refer to the earlier
+> revision.
 
 `gospa.sv` is the SystemVerilog top of the goSPA accelerator. It instantiates
 the APU (activation SRAM + Stage 1 ID-gen + Stage 2 routing) and the PE

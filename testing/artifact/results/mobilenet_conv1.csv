@@ -1,3 +1,2 @@
 arch,layer,cycles,useful_macs,util_pct,fps_100MHz
-V1,mobilenet_conv1,82188,1027158,39.06,1216.7
 V2,mobilenet_conv1,50507,1027158,63.55,1979.9

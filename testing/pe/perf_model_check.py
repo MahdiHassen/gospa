@@ -17,7 +17,7 @@ For every CSV row it:
      and compares them against the measured RTL counters.
 
 Usage:
-    source /Users/mahdi/team-19/.venv/bin/activate
+    source .venv/bin/activate   # from the repo root
     python perf_model_check.py <csv-path> [more csvs...]
 
 No cocotb needed; test_pe.py is NOT imported (it needs cocotb at import time).

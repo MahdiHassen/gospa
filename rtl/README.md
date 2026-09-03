@@ -1,23 +1,34 @@
-# RTL — two architecture versions
+# RTL
 
-Both dataflow interpretations of GoSPA described in the report live here,
-each synthesizable and each with a working testbench tree:
-
-| Dir     | Architecture | Testbenches | Provenance |
-|---------|--------------|-------------|------------|
-| `V1/`   | Multiple kernels per PE: one activation per beat is broadcast to all `N_MULTS` lanes, each lane holds its own kernel and gates on its own WSP; the APU routes on the per-PE **union** WSP. | `testing/V1/` | Snapshot of commit `1c1617f` ("start mini compiler for large input activations"), extracted verbatim. |
-| `V2/`   | One kernel per PE ("1 weight × M activations"): a beat carries up to `N_MULTS` same-PID activations with distinct CIDs; a single Curr weight selected by the beat PID feeds all lanes. WSPs are derived in hardware from the loaded weights. | `testing/` (everything except `testing/V1/`) | Current development tree (moved from `rtl/` at the top level). |
-
-The FPGA synthesis flow (`V2/synth/`) resolves RTL relative to itself and
-targets the V2 tree; `V2/synth/RESULTS.md` records post-route numbers for
-both versions.
-
-To run the system-level golden tests:
+The synthesizable SystemVerilog implementation of GoSPA lives in `V2/`
+(the directory name is historical — an earlier design iteration was removed):
 
 ```
-cd testing/gospa    && make MODULE=test_gospa      # V2
-cd testing/V1/gospa && make MODULE=test_gospa      # V1
+V2/
+  apu/          Activation Processing Unit
+    stage1/       act_sram_scanner, csr_decode, position_encode, idgen,
+                  zero_act, apu_stage1   (CSR scan + ID generation → FIFO-A)
+    stage2/       routing, apu_stage2    (WSP-gated multicast → FIFO-B)
+    apu.sv        Stage-1 + Stage-2 + FIFOs
+  pe/           pe, pe_array, pe_mem, pe_fetch, pe_lane
+  common/       fifo, sram, arith/{mult_pipe, mac_pipe, rca_add}
+  gospa.sv      top level (APU + PE array)
+  synth/        Vivado flow + resource sweep + RESULTS.md
 ```
 
-Note the per-version READMEs inside `V1/` and `V2/` predate some interface
-changes within their own eras — the `.sv` headers are the source of truth.
+The dataflow is "one kernel per PE": a Stage-2 beat carries up to `N_MULTS`
+same-PID activations with distinct CIDs; a single Curr weight selected by the
+beat PID feeds all lanes, and each PE's WSP is derived in hardware from its
+loaded weights.
+
+The FPGA synthesis flow (`V2/synth/`) resolves RTL paths relative to itself;
+`V2/synth/RESULTS.md` records the signed-off post-route numbers.
+
+To run the system-level golden test:
+
+```
+cd testing/gospa && make MODULE=test_gospa
+```
+
+The `.sv` module headers are the source of truth for port lists and
+parameters; `testing/gospa/gospa_tb.py` shows the current host sequence.
